@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Tower Defense"
+version = "1.0.0"
+id = "artifacts/tower-defense"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25154
+
+[services.development]
+run = "pnpm --filter @workspace/tower-defense run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/tower-defense", "run", "build" ]
+publicDir = "artifacts/tower-defense/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25154"
+BASE_PATH = "/"

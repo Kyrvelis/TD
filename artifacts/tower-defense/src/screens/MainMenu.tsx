@@ -24,9 +24,7 @@ export default function MainMenu({ onPlay }: Props) {
           <Button size="lg" className="w-64 h-12 text-base" onClick={onPlay}>
             <MapIcon className="w-5 h-5 mr-2" /> Choose Map
           </Button>
-          <div className="text-xs text-muted-foreground mt-6 max-w-sm">
-            5 tower types · 6 enemy types · Mini-boss every 5 waves · Boss every 10 waves
-          </div>
+          <div className="text-xs text-muted-foreground mt-6 max-w-sm">v.0.1</div>
         </div>
       </div>
     </div>

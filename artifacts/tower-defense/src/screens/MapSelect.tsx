@@ -8,6 +8,7 @@ const diffColor: Record<Difficulty, string> = {
   Easy: "bg-zinc-700 text-zinc-200",
   Medium: "bg-amber-900/60 text-amber-200",
   Hard: "bg-red-900/70 text-red-200",
+  Brutal: "bg-red-700 text-white",
 };
 
 export default function MapSelect({ onSelect, onBack }: Props) {
@@ -20,7 +21,7 @@ export default function MapSelect({ onSelect, onBack }: Props) {
         <h2 className="text-xl font-bold tracking-tight">SELECT THEATER</h2>
       </div>
       <div className="flex-1 overflow-auto p-6">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-6xl mx-auto">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 max-w-7xl mx-auto">
           {MAPS.map(m => (
             <button
               key={m.id}
@@ -30,8 +31,9 @@ export default function MapSelect({ onSelect, onBack }: Props) {
               <div className="relative aspect-[8/5] overflow-hidden" style={{ background: m.bgColor }}>
                 <svg viewBox="0 0 800 500" className="w-full h-full" preserveAspectRatio="none">
                   {m.decorations.map((d, i) => {
-                    if (d.kind === "rect") return <rect key={i} x={d.x} y={d.y} width={d.w} height={d.h} fill={d.color} opacity={d.opacity ?? 1} />;
+                    if (d.kind === "rect") return <rect key={i} x={d.x} y={d.y} width={d.w} height={d.h} fill={d.color} stroke={d.stroke} opacity={d.opacity ?? 1} />;
                     if (d.kind === "circle") return <circle key={i} cx={d.x} cy={d.y} r={d.r} fill={d.color} opacity={d.opacity ?? 1} />;
+                    if (d.kind === "text") return <text key={i} x={d.x} y={d.y} fill={d.color} fontSize={d.size} fontFamily="Inter, sans-serif" fontWeight="700" opacity={d.opacity ?? 1}>{d.text}</text>;
                     return <line key={i} x1={d.x1} y1={d.y1} x2={d.x2} y2={d.y2} stroke={d.color} strokeWidth={d.width} strokeDasharray={d.dash?.join(" ")} opacity={d.opacity ?? 1} />;
                   })}
                   <polyline
@@ -53,9 +55,9 @@ export default function MapSelect({ onSelect, onBack }: Props) {
                   <polyline
                     points={m.waypoints.map(w => `${w.x},${w.y}`).join(" ")}
                     fill="none"
-                    stroke="rgba(255,255,255,0.2)"
-                    strokeWidth="2"
-                    strokeDasharray="8 10"
+                    stroke={m.centerStripe?.color ?? "rgba(255,255,255,0.2)"}
+                    strokeWidth={m.centerStripe?.width ?? 2}
+                    strokeDasharray={(m.centerStripe?.dash ?? [8, 10]).join(" ")}
                     strokeLinecap="round"
                   />
                   <circle cx={m.waypoints[0].x} cy={m.waypoints[0].y} r="14" fill="#f5f5f5" />

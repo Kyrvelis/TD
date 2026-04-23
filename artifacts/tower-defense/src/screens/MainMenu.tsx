@@ -1,13 +1,14 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Crosshair, User, Users, Lock } from "lucide-react";
+import { Crosshair, User, Users, Lock, PencilRuler } from "lucide-react";
 
 type Props = {
   onSinglePlayer: () => void;
   onMultiplayer: () => void;
+  onMapCreator: () => void;
 };
 
-export default function MainMenu({ onSinglePlayer, onMultiplayer }: Props) {
+export default function MainMenu({ onSinglePlayer, onMultiplayer, onMapCreator }: Props) {
   const [name, setName] = useState<string>(() => localStorage.getItem("bulwark.name") || "");
   const [editing, setEditing] = useState<boolean>(() => !localStorage.getItem("bulwark.name"));
   const [draft, setDraft] = useState<string>(name);
@@ -17,8 +18,7 @@ export default function MainMenu({ onSinglePlayer, onMultiplayer }: Props) {
   const saveName = () => {
     const n = draft.trim().slice(0, 20);
     if (!n) return;
-    setName(n);
-    setEditing(false);
+    setName(n); setEditing(false);
   };
 
   return (
@@ -71,14 +71,16 @@ export default function MainMenu({ onSinglePlayer, onMultiplayer }: Props) {
             <Lock className="w-3.5 h-3.5 ml-2 opacity-60" />
             <span className="absolute -top-2 -right-2 text-[9px] uppercase tracking-wider bg-primary text-primary-foreground px-1.5 py-0.5 rounded-sm font-bold">Soon</span>
           </Button>
-          <p className="text-[11px] text-muted-foreground mt-2 leading-snug">
-            Multiplayer (4-player co-op and 2v2 versus with send-enemy mechanics) is queued for the next update.
-          </p>
+          <Button size="lg" variant="outline" className="w-full h-12 text-base rounded-sm relative" onClick={onMapCreator} disabled>
+            <PencilRuler className="w-5 h-5 mr-2" /> Map Creator
+            <Lock className="w-3.5 h-3.5 ml-2 opacity-60" />
+            <span className="absolute -top-2 -right-2 text-[9px] uppercase tracking-wider bg-primary text-primary-foreground px-1.5 py-0.5 rounded-sm font-bold">Soon</span>
+          </Button>
         </div>
       </div>
 
       <div className="absolute bottom-4 right-6 text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
-        v0.2 · Iron Doctrine
+        v0.3 · Iron Doctrine
       </div>
     </div>
   );

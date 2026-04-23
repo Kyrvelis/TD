@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { Heart, Coins, Trophy, Play, FastForward, Pause, Home, Crown, Skull, Eye, Shield, Zap as ZapIcon, ChevronRight, Radar, Wrench, DollarSign, Flame, Bomb } from "lucide-react";
 import {
-  MAPS, TOWERS, TOWER_ORDER, ENEMIES, generateWave, effectiveStats, upgradeCostFor, totalSpent, DAMAGE_LABELS,
-  type MapDef, type Point, type TowerKind, type EnemyKind, type WaveSpawn, type DamageType, type TowerStats, type Appearance,
+  Heart, Coins, Trophy, Play, FastForward, Pause, Home, Crown, Skull, Eye, Shield, ChevronRight,
+  Radar, Wrench, DollarSign, Flame, Bomb, Crosshair, Snowflake, Target, Zap, Plane, AlertTriangle,
+  Repeat,
+} from "lucide-react";
+import {
+  TOWERS, TOWER_ORDER, ENEMIES, generateWave, effectiveStats, upgradeCostFor, totalSpent, DAMAGE_LABELS,
+  type MapDef, type Point, type TowerKind, type EnemyKind, type WaveSpawn, type DamageType, type TowerStats, type NoBuildZone,
 } from "./data";
 
 const W = 800, H = 500;
-const CELL = 40;
 
 type Enemy = {
   id: number;
@@ -33,6 +36,8 @@ type Enemy = {
   healTimer: number;
 };
 
+type Drone = { angle: number; cooldown: number; target: Enemy | null };
+
 type Tower = {
   id: number;
   kind: TowerKind;
@@ -51,20 +56,7 @@ type Tower = {
   stunUntil: number;
 };
 
-type Drone = {
-  angle: number;
-  cooldown: number;
-  target: Enemy | null;
-};
-
-type Mine = {
-  pos: Point;
-  damage: number;
-  splash: number;
-  slowFactor?: number;
-  slowDuration?: number;
-  ttl: number;
-};
+type Mine = { pos: Point; damage: number; splash: number; slowFactor?: number; slowDuration?: number; ttl: number };
 
 type Projectile = {
   id: number;
@@ -87,17 +79,9 @@ type Projectile = {
   arc?: { startY: number; targetY: number; t: number; total: number; startX: number; targetX: number; arcHeight: number };
 };
 
-type Beam = {
-  from: Point;
-  to: Point;
-  color: string;
-  width: number;
-  ttl: number;
-};
-
+type Beam = { from: Point; to: Point; color: string; width: number; ttl: number };
 type Zap = { points: Point[]; ttl: number };
 type Floater = { text: string; pos: Point; ttl: number; color: string };
-
 type Particle = {
   pos: Point;
   vel: Point;
@@ -105,7 +89,8 @@ type Particle = {
   maxTtl: number;
   size: number;
   color: string;
-  kind: "muzzle" | "smoke" | "explosion" | "spark" | "ring" | "fire";
+  kind: "muzzle" | "smoke" | "explosion" | "spark" | "ring" | "fire" | "dust" | "ember";
+  blend?: boolean;
 };
 
 type Props = { map: MapDef; onExit: () => void };
@@ -140,6 +125,15 @@ function isOnPath(p: Point, wp: Point[], pad: number): boolean {
   return false;
 }
 
+function inNoBuildZone(p: Point, zones: NoBuildZone[]): boolean {
+  for (const z of zones) {
+    if (z.kind === "rect") {
+      if (p.x >= z.x && p.x <= z.x + z.w && p.y >= z.y && p.y <= z.y + z.h) return true;
+    } else if (dist(p, z) <= z.r) return true;
+  }
+  return false;
+}
+
 function applyResistance(dmg: number, type: DamageType, e: Enemy): number {
   const def = ENEMIES[e.kind];
   if (def.immunities && def.immunities.includes(type)) return 0;
@@ -168,11 +162,12 @@ export default function Game({ map, onExit }: Props) {
   const placementErrorRef = useRef<{ pos: Point; ttl: number } | null>(null);
 
   const [lives, setLives] = useState(100);
-  const [money, setMoney] = useState(1000);
+  const [money, setMoney] = useState(700);
   const [level, setLevel] = useState(1);
   const [waveActive, setWaveActive] = useState(false);
   const [paused, setPaused] = useState(false);
   const [speed, setSpeed] = useState<1 | 2 | 3>(1);
+  const [autoWave, setAutoWave] = useState(false);
   const [selectedKind, setSelectedKind] = useState<TowerKind | null>(null);
   const [selectedTowerId, setSelectedTowerId] = useState<number | null>(null);
   const [, forceTick] = useState(0);
@@ -183,12 +178,14 @@ export default function Game({ map, onExit }: Props) {
   const waveRef = useRef<{
     spawns: WaveSpawn[]; hpMul: number; spawned: number[]; timers: number[]; active: boolean; bossKind?: EnemyKind;
   } | null>(null);
+  const autoWaveTimerRef = useRef(0);
 
   const livesRef = useRef(lives);
   const moneyRef = useRef(money);
   const levelRef = useRef(level);
   const pausedRef = useRef(paused);
   const speedRef = useRef(speed);
+  const autoWaveRef = useRef(autoWave);
   const waveActiveRef = useRef(waveActive);
   const selectedTowerIdRef = useRef<number | null>(null);
   const selectedKindRef = useRef<TowerKind | null>(null);
@@ -200,6 +197,7 @@ export default function Game({ map, onExit }: Props) {
   useEffect(() => { levelRef.current = level; }, [level]);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
+  useEffect(() => { autoWaveRef.current = autoWave; }, [autoWave]);
   useEffect(() => { waveActiveRef.current = waveActive; }, [waveActive]);
   useEffect(() => { selectedTowerIdRef.current = selectedTowerId; }, [selectedTowerId]);
   useEffect(() => { selectedKindRef.current = selectedKind; }, [selectedKind]);
@@ -211,14 +209,13 @@ export default function Game({ map, onExit }: Props) {
     const lvl = levelRef.current;
     const wave = generateWave(lvl);
     waveRef.current = {
-      spawns: wave.spawns,
-      hpMul: wave.hpMul,
+      spawns: wave.spawns, hpMul: wave.hpMul,
       spawned: wave.spawns.map(() => 0),
       timers: wave.spawns.map(() => 0),
-      active: true,
-      bossKind: wave.bossKind,
+      active: true, bossKind: wave.bossKind,
     };
     setWaveActive(true);
+    autoWaveTimerRef.current = 0;
     const tag = wave.isBoss ? `BOSS WAVE ${lvl}` : wave.isMiniBoss ? `MINI-BOSS WAVE ${lvl}` : `WAVE ${lvl}`;
     setWaveAnnounce(tag);
     setTimeout(() => setWaveAnnounce(null), 1800);
@@ -227,10 +224,12 @@ export default function Game({ map, onExit }: Props) {
   const tryPlaceTower = useCallback((kind: TowerKind, p: Point) => {
     if (gameOverRef.current) return;
     const def = TOWERS[kind];
-    if (moneyRef.current < def.cost) { placementErrorRef.current = { pos: p, ttl: 1.0 }; return; }
-    if (isOnPath(p, map.waypoints, 24)) { placementErrorRef.current = { pos: p, ttl: 1.0 }; return; }
-    for (const t of towersRef.current) if (dist(t.pos, p) < 30) { placementErrorRef.current = { pos: p, ttl: 1.0 }; return; }
-    if (p.x < 18 || p.x > W - 18 || p.y < 18 || p.y > H - 18) { placementErrorRef.current = { pos: p, ttl: 1.0 }; return; }
+    const reject = () => { placementErrorRef.current = { pos: p, ttl: 1.0 }; };
+    if (moneyRef.current < def.cost) return reject();
+    if (isOnPath(p, map.waypoints, 24)) return reject();
+    if (inNoBuildZone(p, map.noBuildZones)) return reject();
+    for (const t of towersRef.current) if (dist(t.pos, p) < 30) return reject();
+    if (p.x < 18 || p.x > W - 18 || p.y < 18 || p.y > H - 18) return reject();
     const drones: Drone[] = [];
     const baseDrones = def.base.droneCount ?? 0;
     for (let i = 0; i < baseDrones; i++) drones.push({ angle: (i / baseDrones) * Math.PI * 2, cooldown: 0, target: null });
@@ -241,7 +240,7 @@ export default function Game({ map, onExit }: Props) {
     });
     setMoney(m => m - def.cost);
     moneyRef.current -= def.cost;
-  }, [map.waypoints]);
+  }, [map.waypoints, map.noBuildZones]);
 
   const upgradeTower = useCallback((id: number, pathIdx: number) => {
     const t = towersRef.current.find(t => t.id === id);
@@ -255,7 +254,6 @@ export default function Game({ map, onExit }: Props) {
     setMoney(m => m - cost);
     if (t.pathIdx === null) t.pathIdx = pathIdx;
     t.tier += 1;
-    // adjust drone count
     const newStats = effectiveStats(def, t.pathIdx, t.tier);
     const want = newStats.droneCount ?? 0;
     while (t.drones.length < want) t.drones.push({ angle: (t.drones.length / Math.max(1, want)) * Math.PI * 2, cooldown: 0, target: null });
@@ -279,20 +277,9 @@ export default function Game({ map, onExit }: Props) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (gameOverRef.current) return;
-      if (e.key === "Escape") {
-        setSelectedKind(null);
-        setSelectedTowerId(null);
-        return;
-      }
-      if (e.key === " " && !waveActiveRef.current) {
-        e.preventDefault();
-        startWave();
-        return;
-      }
-      if (e.key.toLowerCase() === "p") {
-        setPaused(p => !p);
-        return;
-      }
+      if (e.key === "Escape") { setSelectedKind(null); setSelectedTowerId(null); return; }
+      if (e.key === " " && !waveActiveRef.current) { e.preventDefault(); startWave(); return; }
+      if (e.key.toLowerCase() === "p") { setPaused(p => !p); return; }
       const numKey = parseInt(e.key, 10);
       if (!isNaN(numKey) && numKey >= 1 && numKey <= 9) {
         const idx = numKey - 1;
@@ -315,33 +302,31 @@ export default function Game({ map, onExit }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [startWave]);
 
+  // ===== DPR / canvas sizing =====
+  useEffect(() => {
+    const canvas = canvasRef.current!;
+    const updateSize = () => {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+      const targetW = Math.max(1, Math.floor(rect.width * dpr));
+      const targetH = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width !== targetW) canvas.width = targetW;
+      if (canvas.height !== targetH) canvas.height = targetH;
+    };
+    updateSize();
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, []);
+
   // ===== Game loop =====
   useEffect(() => {
     const canvas = canvasRef.current!;
-    const ctx = canvas.getContext("2d")!;
+    const ctx = canvas.getContext("2d", { alpha: false })!;
     let raf = 0;
     let last = performance.now();
 
-    const onMouseMove = (e: MouseEvent) => {
-      const r = canvas.getBoundingClientRect();
-      mouseRef.current = {
-        x: ((e.clientX - r.left) / r.width) * W,
-        y: ((e.clientY - r.top) / r.height) * H,
-      };
-      // hover detection
-      let found: number | null = null;
-      for (const en of enemiesRef.current) {
-        if (!en.alive) continue;
-        const def = ENEMIES[en.kind];
-        if (def.hidden && !cloakKnown(en)) continue;
-        if (dist(en.pos, mouseRef.current) <= def.radius + 4) {
-          found = en.id; break;
-        }
-      }
-      if (found !== hoveredEnemyIdRef.current) setHoveredEnemyId(found);
-    };
     const cloakKnown = (en: Enemy) => {
-      // visible if any tower with hiddenDetect within range or globally
       const def = ENEMIES[en.kind];
       if (!def.hidden) return true;
       for (const t of towersRef.current) {
@@ -353,14 +338,28 @@ export default function Game({ map, onExit }: Props) {
       }
       return false;
     };
+
+    const onMouseMove = (e: MouseEvent) => {
+      const r = canvas.getBoundingClientRect();
+      mouseRef.current = {
+        x: ((e.clientX - r.left) / r.width) * W,
+        y: ((e.clientY - r.top) / r.height) * H,
+      };
+      let found: number | null = null;
+      for (const en of enemiesRef.current) {
+        if (!en.alive) continue;
+        const def = ENEMIES[en.kind];
+        if (def.hidden && !cloakKnown(en)) continue;
+        if (dist(en.pos, mouseRef.current) <= def.radius + 4) { found = en.id; break; }
+      }
+      if (found !== hoveredEnemyIdRef.current) setHoveredEnemyId(found);
+    };
     const onClick = (e: MouseEvent) => {
       const r = canvas.getBoundingClientRect();
       const p = { x: ((e.clientX - r.left) / r.width) * W, y: ((e.clientY - r.top) / r.height) * H };
       for (const t of towersRef.current) {
         if (dist(t.pos, p) < 18) {
-          setSelectedTowerId(t.id);
-          setSelectedKind(null);
-          return;
+          setSelectedTowerId(t.id); setSelectedKind(null); return;
         }
       }
       const k = selectedKindRef.current;
@@ -410,15 +409,12 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    // returns aegis multiplier for damage taken
     const aegisMul = (target: Enemy): number => {
       let mul = 1;
       for (const e of enemiesRef.current) {
         if (!e.alive) continue;
         const def = ENEMIES[e.kind];
-        if (def.aegisAura && dist(e.pos, target.pos) <= def.aegisAura.range) {
-          mul = Math.min(mul, def.aegisAura.resist);
-        }
+        if (def.aegisAura && dist(e.pos, target.pos) <= def.aegisAura.range) mul = Math.min(mul, def.aegisAura.resist);
       }
       return mul;
     };
@@ -445,17 +441,16 @@ export default function Game({ map, onExit }: Props) {
         moneyRef.current += e.reward;
         setMoney(m => m + e.reward);
         floatersRef.current.push({ text: `+${e.reward}`, pos: { ...e.pos }, ttl: 0.8, color: "#dc2626" });
-        // necro
         const def = ENEMIES[e.kind];
         if (def.necroOnDeath) {
           for (let i = 0; i < def.necroOnDeath.count; i++) spawnEnemy(def.necroOnDeath.kind, hpMulNow() * 0.5, e.pos);
         }
-        for (let i = 0; i < 6; i++) {
+        for (let i = 0; i < 8; i++) {
           const ang = Math.random() * Math.PI * 2;
-          const sp = 30 + Math.random() * 60;
+          const sp = 30 + Math.random() * 80;
           particlesRef.current.push({
             pos: { ...e.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp },
-            ttl: 0.4, maxTtl: 0.4, size: 2 + Math.random() * 2,
+            ttl: 0.5, maxTtl: 0.5, size: 2 + Math.random() * 2,
             color: ENEMIES[e.kind].color, kind: "smoke",
           });
         }
@@ -464,10 +459,9 @@ export default function Game({ map, onExit }: Props) {
 
     const hpMulNow = () => waveRef.current?.hpMul ?? 1;
 
-    const enemyVisibleToTower = (e: Enemy, hiddenDetect: boolean, towerPos: Point) => {
+    const enemyVisibleToTower = (e: Enemy, hiddenDetect: boolean, _towerPos: Point) => {
       const def = ENEMIES[e.kind];
       if (def.hidden && !hiddenDetect) return false;
-      // cloak aura: nearby cloakers/wraith hide allies
       if (!hiddenDetect) {
         for (const c of enemiesRef.current) {
           if (!c.alive || c === e) continue;
@@ -475,7 +469,6 @@ export default function Game({ map, onExit }: Props) {
           if (cdef.cloakAura && dist(c.pos, e.pos) <= cdef.cloakAura.range) return false;
         }
       }
-      void towerPos;
       return true;
     };
 
@@ -506,7 +499,6 @@ export default function Game({ map, onExit }: Props) {
       return best;
     };
 
-    // returns buff multipliers from nearby engineer/recon towers
     const buffsFor = (t: Tower): { fireRate: number; damage: number } => {
       let fr = 1, dm = 1;
       for (const o of towersRef.current) {
@@ -525,18 +517,24 @@ export default function Game({ map, onExit }: Props) {
       t.aimAngle = ang;
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
+      // muzzle flash particles
       particlesRef.current.push({
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
-        ttl: 0.08, maxTtl: 0.08, size: 8, color: "#fff37a", kind: "muzzle",
+        ttl: 0.1, maxTtl: 0.1, size: 9, color: "#fff5b0", kind: "muzzle", blend: true,
       });
-      for (let i = 0; i < 3; i++) {
-        const sa = ang + (Math.random() - 0.5) * 0.6;
-        const sp = 80 + Math.random() * 120;
+      for (let i = 0; i < 4; i++) {
+        const sa = ang + (Math.random() - 0.5) * 0.7;
+        const sp = 100 + Math.random() * 140;
         particlesRef.current.push({
           pos: { x: bx, y: by }, vel: { x: Math.cos(sa) * sp, y: Math.sin(sa) * sp },
-          ttl: 0.2, maxTtl: 0.2, size: 1.5, color: "#ffd070", kind: "spark",
+          ttl: 0.25, maxTtl: 0.25, size: 1.5, color: "#ffd070", kind: "spark", blend: true,
         });
       }
+      // barrel smoke
+      particlesRef.current.push({
+        pos: { x: bx, y: by }, vel: { x: Math.cos(ang) * 20, y: Math.sin(ang) * 20 - 10 },
+        ttl: 0.5, maxTtl: 0.5, size: 4, color: "rgba(180,180,180,0.6)", kind: "smoke",
+      });
       projectilesRef.current.push({
         id: idCounter.current++,
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
@@ -553,14 +551,14 @@ export default function Game({ map, onExit }: Props) {
       t.aimAngle = ang;
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
-      // flame jet visuals
-      for (let i = 0; i < 6; i++) {
-        const sa = ang + (Math.random() - 0.5) * 0.5;
-        const sp = 200 + Math.random() * 200;
+      for (let i = 0; i < 7; i++) {
+        const sa = ang + (Math.random() - 0.5) * 0.55;
+        const sp = 200 + Math.random() * 220;
         particlesRef.current.push({
           pos: { x: bx, y: by }, vel: { x: Math.cos(sa) * sp, y: Math.sin(sa) * sp },
-          ttl: 0.3, maxTtl: 0.3, size: 4 + Math.random() * 3,
-          color: i % 2 ? "#ff8a3d" : "#ffae40", kind: "fire",
+          ttl: 0.4, maxTtl: 0.4, size: 4 + Math.random() * 3,
+          color: i % 3 === 0 ? "#ff6020" : i % 3 === 1 ? "#ff8a3d" : "#ffae40",
+          kind: "fire", blend: true,
         });
       }
       projectilesRef.current.push({
@@ -580,7 +578,7 @@ export default function Game({ map, onExit }: Props) {
       const by = t.pos.y + Math.sin(ang) * 14;
       particlesRef.current.push({
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
-        ttl: 0.18, maxTtl: 0.18, size: 10, color: "#888", kind: "smoke",
+        ttl: 0.2, maxTtl: 0.2, size: 12, color: "rgba(140,140,140,0.7)", kind: "smoke",
       });
       projectilesRef.current.push({
         id: idCounter.current++,
@@ -599,14 +597,14 @@ export default function Game({ map, onExit }: Props) {
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
       particlesRef.current.push({
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
-        ttl: 0.18, maxTtl: 0.18, size: 22, color: "#ffae40", kind: "muzzle",
+        ttl: 0.22, maxTtl: 0.22, size: 24, color: "#ffae40", kind: "muzzle", blend: true,
       });
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 10; i++) {
         const sa = ang + (Math.random() - 0.5) * 1.2;
-        const sp = 30 + Math.random() * 80;
+        const sp = 30 + Math.random() * 100;
         particlesRef.current.push({
           pos: { x: bx, y: by }, vel: { x: Math.cos(sa) * sp, y: Math.sin(sa) * sp },
-          ttl: 0.6, maxTtl: 0.6, size: 6 + Math.random() * 4, color: "#666", kind: "smoke",
+          ttl: 0.7, maxTtl: 0.7, size: 6 + Math.random() * 4, color: "rgba(120,120,120,0.7)", kind: "smoke",
         });
       }
       projectilesRef.current.push({
@@ -620,11 +618,10 @@ export default function Game({ map, onExit }: Props) {
     };
 
     const fireMortar = (t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
-      // arc shot — projectile follows parabolic arc; aim straight up visually
       t.aimAngle = -Math.PI / 2;
       particlesRef.current.push({
         pos: { ...t.pos }, vel: { x: 0, y: 0 },
-        ttl: 0.2, maxTtl: 0.2, size: 14, color: "#ffae40", kind: "muzzle",
+        ttl: 0.25, maxTtl: 0.25, size: 16, color: "#ffae40", kind: "muzzle", blend: true,
       });
       const total = dist(t.pos, target.pos) / stats.projectileSpeed + 0.4;
       projectilesRef.current.push({
@@ -643,7 +640,6 @@ export default function Game({ map, onExit }: Props) {
       t.aimAngle = ang;
       const farX = t.pos.x + Math.cos(ang) * Math.max(stats.range, 1000);
       const farY = t.pos.y + Math.sin(ang) * Math.max(stats.range, 1000);
-      // collect enemies near the line
       const hits: Enemy[] = [];
       for (const e of enemiesRef.current) {
         if (!e.alive) continue;
@@ -658,20 +654,24 @@ export default function Game({ map, onExit }: Props) {
         ? actualHits[actualHits.length - 1].pos
         : { x: t.pos.x + Math.cos(ang) * stats.range, y: t.pos.y + Math.sin(ang) * stats.range };
       beamsRef.current.push({ from: { ...t.pos }, to: { ...finalPoint }, color: stats.projectileColor, width: 4, ttl: 0.18 });
-      // muzzle flash
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
-      particlesRef.current.push({ pos: { x: bx, y: by }, vel: { x: 0, y: 0 }, ttl: 0.15, maxTtl: 0.15, size: 16, color: stats.projectileColor, kind: "muzzle" });
+      particlesRef.current.push({ pos: { x: bx, y: by }, vel: { x: 0, y: 0 }, ttl: 0.2, maxTtl: 0.2, size: 18, color: stats.projectileColor, kind: "muzzle", blend: true });
       for (const h of actualHits) damageEnemy(h, stats.damage * dmgMul, stats.damageType);
     };
 
     const triggerExplosion = (pos: Point, radius: number, damage: number, type: DamageType, slowFactor?: number, slowDuration?: number) => {
-      particlesRef.current.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.5, maxTtl: 0.5, size: radius, color: "#ef4444", kind: "ring" });
-      particlesRef.current.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.25, maxTtl: 0.25, size: radius * 0.7, color: "#fff5b0", kind: "explosion" });
-      for (let i = 0; i < 14; i++) {
+      particlesRef.current.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.55, maxTtl: 0.55, size: radius, color: "#ef4444", kind: "ring", blend: true });
+      particlesRef.current.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.3, maxTtl: 0.3, size: radius * 0.75, color: "#fff5b0", kind: "explosion", blend: true });
+      for (let i = 0; i < 18; i++) {
         const ang = Math.random() * Math.PI * 2;
-        const sp = 60 + Math.random() * 200;
-        particlesRef.current.push({ pos: { ...pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.45, maxTtl: 0.45, size: 2 + Math.random() * 3, color: i < 6 ? "#ffae40" : "#888", kind: "smoke" });
+        const sp = 60 + Math.random() * 240;
+        particlesRef.current.push({
+          pos: { ...pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp },
+          ttl: 0.5, maxTtl: 0.5, size: 2 + Math.random() * 3,
+          color: i < 8 ? "#ffae40" : "rgba(110,110,110,0.7)",
+          kind: i < 8 ? "ember" : "smoke", blend: i < 8,
+        });
       }
       for (const e of enemiesRef.current) {
         if (!e.alive) continue;
@@ -680,7 +680,6 @@ export default function Game({ map, onExit }: Props) {
     };
 
     const layMine = (t: Tower, stats: TowerStats, dmgMul: number) => {
-      // place mine somewhere on path within range
       const wp = map.waypoints;
       const candidates: Point[] = [];
       for (let i = 0; i < wp.length - 1; i++) {
@@ -694,7 +693,6 @@ export default function Game({ map, onExit }: Props) {
         }
       }
       if (candidates.length === 0) return;
-      // avoid clustering
       const filtered = candidates.filter(p => !minesRef.current.some(m => dist(m.pos, p) < 18));
       const pool = filtered.length > 0 ? filtered : candidates;
       const pick = pool[Math.floor(Math.random() * pool.length)];
@@ -706,7 +704,7 @@ export default function Game({ map, onExit }: Props) {
 
     const fireDrone = (t: Tower, drone: Drone, target: Enemy, stats: TowerStats, dmgMul: number) => {
       const dronePos = { x: t.pos.x + Math.cos(drone.angle) * 32, y: t.pos.y + Math.sin(drone.angle) * 32 };
-      particlesRef.current.push({ pos: { ...dronePos }, vel: { x: 0, y: 0 }, ttl: 0.08, maxTtl: 0.08, size: 5, color: "#fff37a", kind: "muzzle" });
+      particlesRef.current.push({ pos: { ...dronePos }, vel: { x: 0, y: 0 }, ttl: 0.1, maxTtl: 0.1, size: 6, color: "#fff37a", kind: "muzzle", blend: true });
       const isExplosive = stats.damageType === "explosion";
       projectilesRef.current.push({
         id: idCounter.current++,
@@ -724,7 +722,6 @@ export default function Game({ map, onExit }: Props) {
     const step = (dt: number) => {
       if (dt <= 0) return;
 
-      // spawn enemies from wave
       const wave = waveRef.current;
       if (wave && wave.active) {
         let allDone = true;
@@ -751,24 +748,26 @@ export default function Game({ map, onExit }: Props) {
           moneyRef.current += bonus;
           setMoney(m => m + bonus);
           floatersRef.current.push({ text: `+${bonus} bonus`, pos: { x: W / 2, y: 50 }, ttl: 1.6, color: "#dc2626" });
-          if (levelRef.current >= 30) {
-            setGameOver("win"); gameOverRef.current = "win";
-          } else {
-            const next = levelRef.current + 1;
-            levelRef.current = next; setLevel(next);
-          }
+          if (levelRef.current >= 30) { setGameOver("win"); gameOverRef.current = "win"; }
+          else { const next = levelRef.current + 1; levelRef.current = next; setLevel(next); }
         }
+      }
+
+      // Auto wave: trigger after a delay if waveActive becomes false
+      if (autoWaveRef.current && !waveActiveRef.current && !gameOverRef.current) {
+        autoWaveTimerRef.current += dt;
+        if (autoWaveTimerRef.current >= 4) startWave();
+      } else {
+        autoWaveTimerRef.current = 0;
       }
 
       const now = nowSec();
 
-      // move enemies + per-enemy ticks
       const arrivedEnemies: Enemy[] = [];
       for (const e of enemiesRef.current) {
         if (!e.alive) continue;
         const def = ENEMIES[e.kind];
 
-        // burn DoT
         if (e.burnUntil > now && e.burnDps > 0) {
           e.burnTimer += dt;
           if (e.burnTimer >= 0.25) {
@@ -776,38 +775,27 @@ export default function Game({ map, onExit }: Props) {
             damageEnemy(e, e.burnDps * 0.25, "fire");
           }
         }
-        // regen
         if (def.regen) e.hp = Math.min(e.maxHp, e.hp + def.regen * dt);
-        // healer aura
         if (def.healAura) {
           e.healTimer += dt;
           if (e.healTimer >= 0.5) {
             e.healTimer = 0;
             for (const o of enemiesRef.current) {
               if (!o.alive || o.id === e.id) continue;
-              if (dist(o.pos, e.pos) <= def.healAura.range) {
-                o.hp = Math.min(o.maxHp, o.hp + def.healAura.perSec * 0.5);
-              }
+              if (dist(o.pos, e.pos) <= def.healAura.range) o.hp = Math.min(o.maxHp, o.hp + def.healAura.perSec * 0.5);
             }
           }
         }
-        // phaser invuln cycle
         if (def.phaseInterval) {
           e.phaseTimer += dt;
-          if (e.phaseTimer >= def.phaseInterval) {
-            e.phaseTimer = 0;
-            e.invuln = !e.invuln;
-          }
+          if (e.phaseTimer >= def.phaseInterval) { e.phaseTimer = 0; e.invuln = !e.invuln; }
         }
-        // berserker speed boost
         let bonusSpeed = 1;
         if (def.berserkBelow && e.hp / e.maxHp <= def.berserkBelow) bonusSpeed = 2;
-        // EMP attack on towers
         if (def.empAttack) {
           e.empTimer += dt;
           if (e.empTimer >= def.empAttack.interval) {
             e.empTimer = 0;
-            // find nearest towers
             const inRange = towersRef.current
               .map(t => ({ t, d: dist(t.pos, e.pos) }))
               .filter(x => x.d <= def.empAttack!.range)
@@ -816,8 +804,7 @@ export default function Game({ map, onExit }: Props) {
             for (const x of inRange) {
               x.t.stunUntil = Math.max(x.t.stunUntil, now + def.empAttack!.duration);
               floatersRef.current.push({ text: "EMP", pos: { ...x.t.pos }, ttl: 1.0, color: "#fff37a" });
-              // visual zap
-              zapsRef.current.push({ points: [e.pos, x.t.pos], ttl: 0.25 });
+              zapsRef.current.push({ points: [e.pos, x.t.pos], ttl: 0.3 });
             }
           }
         }
@@ -834,12 +821,9 @@ export default function Game({ map, onExit }: Props) {
           e.summonTimer += dt;
           if (e.summonTimer >= def.summon.interval) {
             e.summonTimer = 0;
-            for (let s = 0; s < def.summon.perSpawn; s++) {
-              spawnEnemy(def.summon.kind, hpMulNow() * 0.6, e.pos);
-            }
+            for (let s = 0; s < def.summon.perSpawn; s++) spawnEnemy(def.summon.kind, hpMulNow() * 0.6, e.pos);
           }
         }
-        // mines: check trigger
         for (const m of minesRef.current) {
           if (m.ttl <= 0) continue;
           if (dist(e.pos, m.pos) <= ENEMIES[e.kind].radius + 6) {
@@ -858,7 +842,6 @@ export default function Game({ map, onExit }: Props) {
         if (newLives <= 0) { setGameOver("lose"); gameOverRef.current = "lose"; }
       }
 
-      // tower fire & passive
       for (const t of towersRef.current) {
         const def = TOWERS[t.kind];
         const stats = effectiveStats(def, t.pathIdx, t.tier);
@@ -867,14 +850,12 @@ export default function Game({ map, onExit }: Props) {
         const fireRate = stats.fireRate * buffs.fireRate;
         const dmgMul = buffs.damage;
 
-        // bank income (only during active wave)
         if (stats.income && waveActiveRef.current) {
           t.incomeTimer += dt;
           if (t.incomeTimer >= stats.income.interval) {
             t.incomeTimer = 0;
-            // black market scales with level (Smuggler/Cartel/Syndicate paths)
             let amt = stats.income.perTick;
-            if (t.pathIdx === 2) {
+            if (t.pathIdx === 1) {
               const lvl = levelRef.current;
               const scale = t.tier === 1 ? 2 : t.tier === 2 ? 4 : t.tier === 3 ? 8 : 0;
               amt += lvl * scale;
@@ -882,16 +863,14 @@ export default function Game({ map, onExit }: Props) {
             moneyRef.current += amt;
             setMoney(m => m + amt);
             floatersRef.current.push({ text: `+${amt}`, pos: { x: t.pos.x, y: t.pos.y - 18 }, ttl: 0.9, color: "#fff37a" });
-            // coin spark
-            for (let i = 0; i < 4; i++) {
+            for (let i = 0; i < 5; i++) {
               const ang = -Math.PI / 2 + (Math.random() - 0.5);
               const sp = 60 + Math.random() * 40;
-              particlesRef.current.push({ pos: { ...t.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.5, maxTtl: 0.5, size: 3, color: "#fff37a", kind: "spark" });
+              particlesRef.current.push({ pos: { ...t.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.5, maxTtl: 0.5, size: 3, color: "#fff37a", kind: "spark", blend: true });
             }
           }
         }
 
-        // mine layer
         if (stats.mineDamage && stats.mineCooldown !== undefined && waveActiveRef.current) {
           t.mineTimer += dt;
           if (t.mineTimer >= stats.mineCooldown) {
@@ -900,7 +879,6 @@ export default function Game({ map, onExit }: Props) {
           }
         }
 
-        // drones
         if (t.drones.length > 0) {
           for (const d of t.drones) {
             d.angle += dt * 1.4;
@@ -953,7 +931,7 @@ export default function Game({ map, onExit }: Props) {
             hits.push(next); visited.add(next.id); last_ = next;
           }
           const points: Point[] = [t.pos, ...hits.map(h => h.pos)];
-          zapsRef.current.push({ points, ttl: 0.18 });
+          zapsRef.current.push({ points, ttl: 0.2 });
           for (let i = 0; i < hits.length; i++) {
             const dmg = stats.damage * dmgMul * Math.pow(0.85, i);
             damageEnemy(hits[i], dmg, stats.damageType, stats.slowFactor, stats.slowDuration);
@@ -969,7 +947,7 @@ export default function Game({ map, onExit }: Props) {
         } else if (t.kind === "flame") {
           fireFlame(t, visTarget, stats, dmgMul);
         } else if (t.kind === "drone" || t.kind === "bank" || t.kind === "recon" || t.kind === "minelayer" || t.kind === "engineer") {
-          // these have no direct main attack (handled by drones/passive)
+          // no direct attack
         } else {
           if (stats.burstCount && stats.burstCount > 1) {
             t.burstQueue = stats.burstCount - 1;
@@ -982,14 +960,12 @@ export default function Game({ map, onExit }: Props) {
         }
       }
 
-      // projectiles
       for (const p of projectilesRef.current) {
         if (!p.alive) continue;
         if (p.arc) {
           p.arc.t += dt;
           const tt = Math.min(1, p.arc.t / p.arc.total);
           p.pos.x = p.arc.startX + (p.arc.targetX - p.arc.startX) * tt;
-          // parabola: y = lerp(start, target, tt) - 4*h*tt*(1-tt)
           p.pos.y = p.arc.startY + (p.arc.targetY - p.arc.startY) * tt - 4 * p.arc.arcHeight * tt * (1 - tt);
           if (tt >= 1) {
             if (p.splashRadius) triggerExplosion({ x: p.arc.targetX, y: p.arc.targetY }, p.splashRadius, p.damage, p.damageType);
@@ -1004,14 +980,13 @@ export default function Game({ map, onExit }: Props) {
         const stepLen = p.speed * dt;
         if (d <= stepLen) {
           p.pos = { ...aim };
-          if (p.splashRadius) {
-            triggerExplosion(p.pos, p.splashRadius, p.damage, p.damageType, p.slowFactor, p.slowDuration);
-          } else if (p.target && p.target.alive) {
+          if (p.splashRadius) triggerExplosion(p.pos, p.splashRadius, p.damage, p.damageType, p.slowFactor, p.slowDuration);
+          else if (p.target && p.target.alive) {
             damageEnemy(p.target, p.damage, p.damageType, p.slowFactor, p.slowDuration, p.burnDps, p.burnDuration);
-            for (let i = 0; i < 3; i++) {
+            for (let i = 0; i < 4; i++) {
               const ang = Math.random() * Math.PI * 2;
-              const sp = 30 + Math.random() * 50;
-              particlesRef.current.push({ pos: { ...p.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.18, maxTtl: 0.18, size: 1.5, color: p.color, kind: "spark" });
+              const sp = 30 + Math.random() * 60;
+              particlesRef.current.push({ pos: { ...p.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.2, maxTtl: 0.2, size: 1.5, color: p.color, kind: "spark", blend: true });
             }
           }
           p.alive = false;
@@ -1021,7 +996,6 @@ export default function Game({ map, onExit }: Props) {
         }
       }
 
-      // particles
       for (const p of particlesRef.current) {
         p.pos.x += p.vel.x * dt;
         p.pos.y += p.vel.y * dt;
@@ -1030,7 +1004,6 @@ export default function Game({ map, onExit }: Props) {
         p.ttl -= dt;
       }
 
-      // cleanup
       enemiesRef.current = enemiesRef.current.filter(e => e.alive);
       projectilesRef.current = projectilesRef.current.filter(p => p.alive);
       minesRef.current = minesRef.current.filter(m => m.ttl > 0);
@@ -1048,39 +1021,156 @@ export default function Game({ map, onExit }: Props) {
     };
 
     // ===== Render helpers =====
+    const drawNoBuildZones = (ctx: CanvasRenderingContext2D) => {
+      for (const z of map.noBuildZones) {
+        if (z.tone === "building" || z.tone === undefined) continue; // buildings drawn as decorations; no overlay needed
+        // park / water / wall / platform / rail get a subtle hatched overlay so player can see they can't build there
+        ctx.save();
+        ctx.globalAlpha = 0;
+        if (z.kind === "rect") {
+          ctx.beginPath(); ctx.rect(z.x, z.y, z.w, z.h);
+        } else {
+          ctx.beginPath(); ctx.arc(z.x, z.y, z.r, 0, Math.PI * 2);
+        }
+        ctx.restore();
+      }
+    };
+
+    const drawDecorations = (ctx: CanvasRenderingContext2D, decs: typeof map.decorations) => {
+      for (const d of decs) {
+        ctx.globalAlpha = (d as { opacity?: number }).opacity ?? 1;
+        if (d.kind === "rect") {
+          if ((d as { radius?: number }).radius) {
+            const r = (d as { radius?: number }).radius!;
+            ctx.fillStyle = d.color;
+            ctx.beginPath();
+            const rx = Math.min(r, d.w / 2), ry = Math.min(r, d.h / 2);
+            ctx.moveTo(d.x + rx, d.y);
+            ctx.lineTo(d.x + d.w - rx, d.y); ctx.quadraticCurveTo(d.x + d.w, d.y, d.x + d.w, d.y + ry);
+            ctx.lineTo(d.x + d.w, d.y + d.h - ry); ctx.quadraticCurveTo(d.x + d.w, d.y + d.h, d.x + d.w - rx, d.y + d.h);
+            ctx.lineTo(d.x + rx, d.y + d.h); ctx.quadraticCurveTo(d.x, d.y + d.h, d.x, d.y + d.h - ry);
+            ctx.lineTo(d.x, d.y + ry); ctx.quadraticCurveTo(d.x, d.y, d.x + rx, d.y);
+            ctx.closePath(); ctx.fill();
+          } else {
+            ctx.fillStyle = d.color;
+            ctx.fillRect(d.x, d.y, d.w, d.h);
+          }
+          if (d.stroke) {
+            ctx.strokeStyle = d.stroke; ctx.lineWidth = d.strokeWidth ?? 1;
+            ctx.strokeRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1);
+          }
+        } else if (d.kind === "circle") {
+          ctx.fillStyle = d.color; ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2); ctx.fill();
+          if (d.stroke) { ctx.strokeStyle = d.stroke; ctx.lineWidth = 1; ctx.stroke(); }
+        } else if (d.kind === "line") {
+          ctx.strokeStyle = d.color; ctx.lineWidth = d.width;
+          ctx.lineCap = d.cap === "round" ? "round" : "butt";
+          if (d.dash) ctx.setLineDash(d.dash); else ctx.setLineDash([]);
+          ctx.beginPath(); ctx.moveTo(d.x1, d.y1); ctx.lineTo(d.x2, d.y2); ctx.stroke();
+          ctx.setLineDash([]); ctx.lineCap = "butt";
+        } else if (d.kind === "text") {
+          ctx.fillStyle = d.color;
+          ctx.font = `${d.weight ?? 700} ${d.size}px Inter, sans-serif`;
+          ctx.textAlign = d.align ?? "left";
+          ctx.fillText(d.text, d.x, d.y);
+          ctx.textAlign = "left";
+        } else if (d.kind === "polyline") {
+          ctx.strokeStyle = d.color; ctx.lineWidth = d.width;
+          if (d.dash) ctx.setLineDash(d.dash);
+          ctx.beginPath();
+          for (let i = 0; i < d.points.length; i++) {
+            if (i === 0) ctx.moveTo(d.points[i].x, d.points[i].y);
+            else ctx.lineTo(d.points[i].x, d.points[i].y);
+          }
+          ctx.stroke(); ctx.setLineDash([]);
+        } else if (d.kind === "windowGrid") {
+          const cw = d.w / d.cols;
+          const rh = d.h / d.rows;
+          for (let r = 0; r < d.rows; r++) {
+            for (let c = 0; c < d.cols; c++) {
+              const lit = ((c * 7 + r * 11 + d.x + d.y) % 5) >= 2;
+              if (!lit) continue;
+              ctx.fillStyle = d.color;
+              ctx.globalAlpha = (d.opacity ?? 0.85) * (0.4 + ((c + r) % 3) * 0.2);
+              ctx.fillRect(d.x + c * cw + 1, d.y + r * rh + 1, Math.max(1, cw - 2), Math.max(1, rh - 2));
+            }
+          }
+          ctx.globalAlpha = 1;
+        } else if (d.kind === "bridge") {
+          // shadow
+          const ang = Math.atan2(d.to.y - d.from.y, d.to.x - d.from.x);
+          const nx = -Math.sin(ang), ny = Math.cos(ang);
+          const halfW = d.width / 2;
+          // bridge shadow under
+          ctx.fillStyle = "rgba(0,0,0,0.45)";
+          ctx.beginPath();
+          ctx.moveTo(d.from.x + nx * (halfW + 4) + Math.cos(ang) * 2, d.from.y + ny * (halfW + 4) + Math.sin(ang) * 2);
+          ctx.lineTo(d.to.x + nx * (halfW + 4) + Math.cos(ang) * 2, d.to.y + ny * (halfW + 4) + Math.sin(ang) * 2);
+          ctx.lineTo(d.to.x - nx * (halfW + 4) + Math.cos(ang) * 2, d.to.y - ny * (halfW + 4) + Math.sin(ang) * 2);
+          ctx.lineTo(d.from.x - nx * (halfW + 4) + Math.cos(ang) * 2, d.from.y - ny * (halfW + 4) + Math.sin(ang) * 2);
+          ctx.closePath(); ctx.fill();
+          // deck
+          ctx.fillStyle = d.deckColor;
+          ctx.beginPath();
+          ctx.moveTo(d.from.x + nx * halfW, d.from.y + ny * halfW);
+          ctx.lineTo(d.to.x + nx * halfW, d.to.y + ny * halfW);
+          ctx.lineTo(d.to.x - nx * halfW, d.to.y - ny * halfW);
+          ctx.lineTo(d.from.x - nx * halfW, d.from.y - ny * halfW);
+          ctx.closePath(); ctx.fill();
+          // rails (red lines along edges)
+          ctx.strokeStyle = d.railColor; ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(d.from.x + nx * halfW, d.from.y + ny * halfW);
+          ctx.lineTo(d.to.x + nx * halfW, d.to.y + ny * halfW);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(d.from.x - nx * halfW, d.from.y - ny * halfW);
+          ctx.lineTo(d.to.x - nx * halfW, d.to.y - ny * halfW);
+          ctx.stroke();
+          // bridge supports (vertical lines)
+          ctx.strokeStyle = "#0a0a0a"; ctx.lineWidth = 1;
+          const supports = 4;
+          for (let i = 0; i < supports; i++) {
+            const tt = (i + 1) / (supports + 1);
+            const cx = d.from.x + (d.to.x - d.from.x) * tt;
+            const cy = d.from.y + (d.to.y - d.from.y) * tt;
+            ctx.beginPath();
+            ctx.moveTo(cx + nx * halfW, cy + ny * halfW);
+            ctx.lineTo(cx - nx * halfW, cy - ny * halfW);
+            ctx.stroke();
+          }
+        }
+        ctx.globalAlpha = 1;
+      }
+    };
+
     const drawAppearance = (ctx: CanvasRenderingContext2D, t: Tower, stats: TowerStats) => {
       const app = stats.appearance ?? [];
-      // helmet (small dome on top of body)
       if (app.includes("helmet")) {
-        ctx.fillStyle = "#111";
+        ctx.fillStyle = "#0a0a0a";
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y - 7, 8, Math.PI, 0); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5; ctx.stroke();
       }
-      // beret (slanted disk)
       if (app.includes("beret")) {
-        ctx.fillStyle = "#22c55e";
         ctx.save();
-        ctx.translate(t.pos.x, t.pos.y - 9);
-        ctx.rotate(-0.3);
+        ctx.translate(t.pos.x, t.pos.y - 9); ctx.rotate(-0.3);
+        ctx.fillStyle = "#22c55e";
         ctx.beginPath(); ctx.ellipse(0, 0, 9, 4, 0, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = "#dc2626";
         ctx.beginPath(); ctx.arc(-5, -1, 1.5, 0, Math.PI * 2); ctx.fill();
         ctx.restore();
       }
-      // satellite dish (large circular dish)
       if (app.includes("satellite_dish")) {
-        ctx.save();
-        ctx.translate(t.pos.x, t.pos.y);
-        ctx.rotate(-0.3);
-        ctx.fillStyle = "#1a1a1a";
+        ctx.save(); ctx.translate(t.pos.x, t.pos.y); ctx.rotate(-0.3);
+        const grad = ctx.createRadialGradient(-3, -3, 0, 0, 0, 11);
+        grad.addColorStop(0, "#3a3a3a"); grad.addColorStop(1, "#0a0a0a");
+        ctx.fillStyle = grad;
         ctx.beginPath(); ctx.arc(0, 0, 11, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
         ctx.beginPath(); ctx.arc(0, 0, 11, 0, Math.PI * 2); ctx.stroke();
-        ctx.fillStyle = stats.accentColor;
-        ctx.fillRect(-1, -1, 2, 6);
+        ctx.fillStyle = stats.accentColor; ctx.fillRect(-1, -1, 2, 6);
         ctx.restore();
       }
-      // antenna(s)
       if (app.includes("antenna")) {
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.2;
         ctx.beginPath(); ctx.moveTo(t.pos.x - 6, t.pos.y - 12); ctx.lineTo(t.pos.x - 6, t.pos.y - 22); ctx.stroke();
@@ -1089,55 +1179,34 @@ export default function Game({ map, onExit }: Props) {
         ctx.beginPath(); ctx.arc(t.pos.x - 6, t.pos.y - 22, 1.5, 0, Math.PI * 2); ctx.fill();
         ctx.beginPath(); ctx.arc(t.pos.x + 6, t.pos.y - 24, 1.5, 0, Math.PI * 2); ctx.fill();
       }
-      // scope on barrel (rotated)
       if (app.includes("scope") || app.includes("extra_optic")) {
-        ctx.save();
-        ctx.translate(t.pos.x, t.pos.y);
-        ctx.rotate(t.aimAngle);
-        ctx.fillStyle = "#111";
-        ctx.fillRect(stats.barrelLength * 0.4, -6, 5, 4);
-        ctx.fillStyle = stats.accentColor;
-        ctx.fillRect(stats.barrelLength * 0.4, -6, 5, 1);
-        if (app.includes("extra_optic")) {
-          ctx.fillStyle = "#1a1a1a";
-          ctx.fillRect(stats.barrelLength * 0.4 + 6, -7, 4, 5);
-        }
+        ctx.save(); ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle);
+        ctx.fillStyle = "#0a0a0a"; ctx.fillRect(stats.barrelLength * 0.4, -6, 5, 4);
+        ctx.fillStyle = stats.accentColor; ctx.fillRect(stats.barrelLength * 0.4, -6, 5, 1);
+        if (app.includes("extra_optic")) { ctx.fillStyle = "#1a1a1a"; ctx.fillRect(stats.barrelLength * 0.4 + 6, -7, 4, 5); }
         ctx.restore();
       }
-      // bipod
       if (app.includes("bipod")) {
-        ctx.save();
-        ctx.translate(t.pos.x, t.pos.y);
-        ctx.rotate(t.aimAngle);
+        ctx.save(); ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle);
         ctx.strokeStyle = "#0a0a0a"; ctx.lineWidth = 1.5;
         ctx.beginPath(); ctx.moveTo(stats.barrelLength * 0.7, 0); ctx.lineTo(stats.barrelLength * 0.7 + 4, 6); ctx.stroke();
         ctx.beginPath(); ctx.moveTo(stats.barrelLength * 0.7, 0); ctx.lineTo(stats.barrelLength * 0.7 + 4, -6); ctx.stroke();
         ctx.restore();
       }
-      // muzzle brake
       if (app.includes("muzzle_brake")) {
-        ctx.save();
-        ctx.translate(t.pos.x, t.pos.y);
-        ctx.rotate(t.aimAngle);
-        ctx.fillStyle = "#0a0a0a";
-        ctx.fillRect(stats.barrelLength - 1, -stats.barrelWidth / 2 - 2, 4, stats.barrelWidth + 4);
-        ctx.fillStyle = stats.accentColor;
-        ctx.fillRect(stats.barrelLength + 1, -1, 2, 2);
+        ctx.save(); ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle);
+        ctx.fillStyle = "#0a0a0a"; ctx.fillRect(stats.barrelLength - 1, -stats.barrelWidth / 2 - 2, 4, stats.barrelWidth + 4);
+        ctx.fillStyle = stats.accentColor; ctx.fillRect(stats.barrelLength + 1, -1, 2, 2);
         ctx.restore();
       }
-      // shield plate around base
       if (app.includes("shield_plate")) {
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 2;
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 17, -Math.PI * 0.7, -Math.PI * 0.3); ctx.stroke();
       }
-      // heavy cap (chunk on top)
       if (app.includes("heavy_cap")) {
-        ctx.fillStyle = "#0a0a0a";
-        ctx.fillRect(t.pos.x - 8, t.pos.y - 14, 16, 5);
-        ctx.fillStyle = stats.accentColor;
-        ctx.fillRect(t.pos.x - 8, t.pos.y - 14, 16, 1);
+        ctx.fillStyle = "#0a0a0a"; ctx.fillRect(t.pos.x - 8, t.pos.y - 14, 16, 5);
+        ctx.fillStyle = stats.accentColor; ctx.fillRect(t.pos.x - 8, t.pos.y - 14, 16, 1);
       }
-      // spikes
       if (app.includes("spikes")) {
         ctx.fillStyle = stats.accentColor;
         for (let i = 0; i < 6; i++) {
@@ -1146,40 +1215,72 @@ export default function Game({ map, onExit }: Props) {
           ctx.moveTo(t.pos.x + Math.cos(a) * 14, t.pos.y + Math.sin(a) * 14);
           ctx.lineTo(t.pos.x + Math.cos(a) * 19, t.pos.y + Math.sin(a) * 19);
           ctx.lineTo(t.pos.x + Math.cos(a + 0.2) * 14, t.pos.y + Math.sin(a + 0.2) * 14);
-          ctx.closePath();
-          ctx.fill();
+          ctx.closePath(); ctx.fill();
         }
       }
-      // energy core (glowing center)
       if (app.includes("energy_core")) {
         const pulse = 0.6 + Math.sin(performance.now() / 200) * 0.4;
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
         ctx.fillStyle = stats.accentColor;
         ctx.globalAlpha = pulse;
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 5, 0, Math.PI * 2); ctx.fill();
-        ctx.globalAlpha = 1;
+        ctx.globalAlpha = 0.3;
+        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 9, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
       }
+    };
+
+    const drawTowerBase = (ctx: CanvasRenderingContext2D, t: Tower, stats: TowerStats) => {
+      // soft shadow
+      const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
+      grad0.addColorStop(0, "rgba(0,0,0,0.5)");
+      grad0.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = grad0;
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
+
+      // sandbag ring (4 small bumps)
+      ctx.fillStyle = "#3a3528";
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        ctx.beginPath(); ctx.arc(t.pos.x + Math.cos(a) * 16, t.pos.y + Math.sin(a) * 16, 3.2, 0, Math.PI * 2); ctx.fill();
+      }
+      // dark base ring
+      ctx.fillStyle = "#0a0a0a";
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 17, 0, Math.PI * 2); ctx.fill();
+      // body radial gradient
+      const bg = ctx.createRadialGradient(t.pos.x - 5, t.pos.y - 5, 1, t.pos.x, t.pos.y, 15);
+      bg.addColorStop(0, lighten(stats.bodyColor, 25));
+      bg.addColorStop(0.5, stats.bodyColor);
+      bg.addColorStop(1, darken(stats.bodyColor, 25));
+      ctx.fillStyle = bg;
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
+      // accent ring
+      ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
+      // top highlight
+      ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, -Math.PI * 0.85, -Math.PI * 0.25); ctx.stroke();
     };
 
     const drawTower = (ctx: CanvasRenderingContext2D, t: Tower, alpha: number) => {
       const def = TOWERS[t.kind];
       const stats = effectiveStats(def, t.pathIdx, t.tier);
       ctx.globalAlpha = alpha;
-      // shadow
-      ctx.fillStyle = "#000";
-      ctx.beginPath(); ctx.arc(t.pos.x + 1, t.pos.y + 2, 18, 0, Math.PI * 2); ctx.fill();
 
-      // base by tower kind
-      ctx.fillStyle = "#0a0a0a";
       if (t.kind === "bank") {
-        // vault square
-        ctx.fillRect(t.pos.x - 16, t.pos.y - 16, 32, 32);
-        ctx.fillStyle = stats.bodyColor;
-        ctx.fillRect(t.pos.x - 14, t.pos.y - 14, 28, 28);
+        // soft shadow
+        const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
+        grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#0a0a0a"; ctx.fillRect(t.pos.x - 16, t.pos.y - 16, 32, 32);
+        const bg = ctx.createLinearGradient(t.pos.x - 14, t.pos.y - 14, t.pos.x + 14, t.pos.y + 14);
+        bg.addColorStop(0, lighten(stats.bodyColor, 20)); bg.addColorStop(1, darken(stats.bodyColor, 20));
+        ctx.fillStyle = bg; ctx.fillRect(t.pos.x - 14, t.pos.y - 14, 28, 28);
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 2;
         ctx.strokeRect(t.pos.x - 14, t.pos.y - 14, 28, 28);
         // vault wheel
-        ctx.fillStyle = "#1a1a1a";
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 8, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#1a1a1a"; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 8, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1;
         for (let i = 0; i < 6; i++) {
           const a = (i / 6) * Math.PI * 2;
@@ -1188,24 +1289,19 @@ export default function Game({ map, onExit }: Props) {
           ctx.lineTo(t.pos.x + Math.cos(a) * 9, t.pos.y + Math.sin(a) * 9);
           ctx.stroke();
         }
-        // $ symbol
         ctx.fillStyle = stats.accentColor;
-        ctx.font = "bold 12px Inter, sans-serif";
-        ctx.textAlign = "center";
+        ctx.font = "bold 12px Inter, sans-serif"; ctx.textAlign = "center";
         ctx.fillText("$", t.pos.x, t.pos.y - 14);
       } else if (t.kind === "drone") {
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 18, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
-        // landing pad H
+        drawTowerBase(ctx, t, stats);
         ctx.fillStyle = stats.accentColor;
-        ctx.font = "bold 10px Inter, sans-serif";
-        ctx.textAlign = "center";
+        ctx.font = "bold 10px Inter, sans-serif"; ctx.textAlign = "center";
         ctx.fillText("H", t.pos.x, t.pos.y + 4);
       } else if (t.kind === "engineer") {
         // hex base
+        const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
+        grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = "#0a0a0a";
         ctx.beginPath();
         for (let i = 0; i < 6; i++) {
@@ -1214,7 +1310,9 @@ export default function Game({ map, onExit }: Props) {
           else ctx.lineTo(t.pos.x + Math.cos(a) * 18, t.pos.y + Math.sin(a) * 18);
         }
         ctx.closePath(); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
+        const bg = ctx.createRadialGradient(t.pos.x - 4, t.pos.y - 4, 1, t.pos.x, t.pos.y, 15);
+        bg.addColorStop(0, lighten(stats.bodyColor, 20)); bg.addColorStop(1, darken(stats.bodyColor, 25));
+        ctx.fillStyle = bg;
         ctx.beginPath();
         for (let i = 0; i < 6; i++) {
           const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
@@ -1223,83 +1321,70 @@ export default function Game({ map, onExit }: Props) {
         }
         ctx.closePath(); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5; ctx.stroke();
-        // wrench
+        // wrench icon
         ctx.fillStyle = stats.accentColor;
         ctx.fillRect(t.pos.x - 1, t.pos.y - 6, 2, 10);
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y - 6, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#0a0a0a"; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y - 6, 1.5, 0, Math.PI * 2); ctx.fill();
       } else if (t.kind === "minelayer") {
-        // boxy with warning markers
-        ctx.fillStyle = "#0a0a0a";
-        ctx.fillRect(t.pos.x - 16, t.pos.y - 14, 32, 28);
-        ctx.fillStyle = stats.bodyColor;
-        ctx.fillRect(t.pos.x - 14, t.pos.y - 12, 28, 24);
-        // diagonal warning stripes
+        // shadow
+        const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
+        grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#0a0a0a"; ctx.fillRect(t.pos.x - 16, t.pos.y - 14, 32, 28);
+        const bg = ctx.createLinearGradient(t.pos.x, t.pos.y - 12, t.pos.x, t.pos.y + 12);
+        bg.addColorStop(0, lighten(stats.bodyColor, 15)); bg.addColorStop(1, darken(stats.bodyColor, 25));
+        ctx.fillStyle = bg; ctx.fillRect(t.pos.x - 14, t.pos.y - 12, 28, 24);
         ctx.fillStyle = stats.accentColor;
-        for (let i = -14; i < 14; i += 6) {
-          ctx.fillRect(t.pos.x + i, t.pos.y - 12, 3, 24);
-        }
-      } else if (t.kind === "recon") {
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 18, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
+        for (let i = -14; i < 14; i += 6) ctx.fillRect(t.pos.x + i, t.pos.y - 12, 3, 24);
       } else if (t.kind === "mortar") {
-        // pit base
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 18, 0, Math.PI * 2); ctx.fill();
+        const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
+        grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
+        // pit
         ctx.fillStyle = "#1a1a1a";
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 16, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
+        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 17, 0, Math.PI * 2); ctx.fill();
+        const bg = ctx.createRadialGradient(t.pos.x - 4, t.pos.y - 4, 1, t.pos.x, t.pos.y, 12);
+        bg.addColorStop(0, lighten(stats.bodyColor, 20)); bg.addColorStop(1, darken(stats.bodyColor, 25));
+        ctx.fillStyle = bg;
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 12, 0, Math.PI * 2); ctx.fill();
-        // tube pointed up
+        // tube up
         ctx.fillStyle = stats.barrelColor;
         ctx.fillRect(t.pos.x - stats.barrelWidth / 2, t.pos.y - stats.barrelLength, stats.barrelWidth, stats.barrelLength + 2);
         ctx.fillStyle = stats.accentColor;
         ctx.fillRect(t.pos.x - stats.barrelWidth / 2 - 1, t.pos.y - stats.barrelLength - 1, stats.barrelWidth + 2, 2);
-      } else if (t.kind === "railgun") {
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 18, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
       } else if (t.kind === "flame") {
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 18, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
+        drawTowerBase(ctx, t, stats);
         // fuel tank on back
-        ctx.save();
-        ctx.translate(t.pos.x, t.pos.y);
-        ctx.rotate(t.aimAngle + Math.PI);
-        ctx.fillStyle = "#3a2a22";
-        ctx.fillRect(8, -5, 10, 10);
-        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1;
-        ctx.strokeRect(8, -5, 10, 10);
+        ctx.save(); ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle + Math.PI);
+        ctx.fillStyle = "#3a2a22"; ctx.fillRect(8, -5, 10, 10);
+        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1; ctx.strokeRect(8, -5, 10, 10);
+        // tank stripe
+        ctx.fillStyle = "#dc2626"; ctx.fillRect(8, -1, 10, 2);
         ctx.restore();
       } else {
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 18, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.bodyColor;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
+        drawTowerBase(ctx, t, stats);
       }
 
-      // barrels for combat towers
+      // barrel for combat towers
       if (stats.barrelLength > 0 && t.kind !== "mortar" && t.kind !== "bank" && t.kind !== "drone" && t.kind !== "recon" && t.kind !== "engineer" && t.kind !== "minelayer") {
         ctx.save();
-        ctx.translate(t.pos.x, t.pos.y);
-        ctx.rotate(t.aimAngle);
+        ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle);
         const barrels = (
-          (t.kind === "howitzer" && t.pathIdx === 2 && t.tier >= 2) ? (t.tier >= 3 ? 4 : 2) :
-          (t.kind === "frost" && t.pathIdx === 1 && t.tier >= 1) ? 2 :
+          (t.kind === "howitzer" && t.pathIdx === 1 && t.tier >= 2) ? (t.tier >= 3 ? 4 : 2) :
           (t.kind === "rifleman" && t.pathIdx === 0 && t.tier >= 3) ? 2 :
           1
         );
         for (let b = 0; b < barrels; b++) {
           const off = barrels === 1 ? 0 : (b - (barrels - 1) / 2) * 4;
-          ctx.fillStyle = stats.barrelColor;
+          // barrel body with metallic gradient
+          const bg = ctx.createLinearGradient(0, off - stats.barrelWidth / 2, 0, off + stats.barrelWidth / 2);
+          bg.addColorStop(0, lighten(stats.barrelColor, 20));
+          bg.addColorStop(0.5, stats.barrelColor);
+          bg.addColorStop(1, darken(stats.barrelColor, 25));
+          ctx.fillStyle = bg;
           ctx.fillRect(0, off - stats.barrelWidth / 2, stats.barrelLength, stats.barrelWidth);
+          // muzzle accent
           ctx.fillStyle = stats.accentColor;
           ctx.fillRect(stats.barrelLength - 2, off - stats.barrelWidth / 2 - 1, 3, stats.barrelWidth + 2);
         }
@@ -1308,50 +1393,52 @@ export default function Game({ map, onExit }: Props) {
           ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI * 2); ctx.fill();
         }
         if (stats.underbarrel) {
-          ctx.fillStyle = "#1a1a1a";
-          ctx.fillRect(2, 4, 14, 4);
-          ctx.fillStyle = "#dc2626";
-          ctx.beginPath(); ctx.arc(14, 6, 1.5, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = "#1a1a1a"; ctx.fillRect(2, 4, 14, 4);
+          ctx.fillStyle = "#dc2626"; ctx.beginPath(); ctx.arc(14, 6, 1.5, 0, Math.PI * 2); ctx.fill();
         }
         ctx.restore();
       }
 
-      // appearance overlays (helmet/beret/scope/etc.)
       drawAppearance(ctx, t, stats);
 
-      // hidden detect badge
       if (stats.hiddenDetect) {
         ctx.fillStyle = "#dc2626";
         ctx.beginPath(); ctx.arc(t.pos.x + 12, t.pos.y - 12, 3.5, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.stroke();
       }
-      // tier pips
       for (let i = 0; i < t.tier; i++) {
         ctx.fillStyle = "#dc2626";
         ctx.fillRect(t.pos.x - 9 + i * 7, t.pos.y + 22, 5, 3);
       }
-      // stunned indicator
       if (t.stunUntil > performance.now() / 1000) {
         ctx.strokeStyle = "#fff37a"; ctx.lineWidth = 2;
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 22, 0, Math.PI * 2); ctx.stroke();
-        ctx.fillStyle = "#fff37a";
-        ctx.font = "bold 9px Inter, sans-serif";
-        ctx.textAlign = "center";
+        ctx.fillStyle = "#fff37a"; ctx.font = "bold 9px Inter, sans-serif"; ctx.textAlign = "center";
         ctx.fillText("STUNNED", t.pos.x, t.pos.y - 26);
       }
 
-      // drones orbit
       for (const d of t.drones) {
         const dx = t.pos.x + Math.cos(d.angle) * 32;
         const dy = t.pos.y + Math.sin(d.angle) * 32;
-        ctx.fillStyle = "#0a0a0a";
+        // drone body
+        const dg = ctx.createRadialGradient(dx - 1, dy - 1, 0, dx, dy, 5);
+        dg.addColorStop(0, lighten(stats.accentColor, 30));
+        dg.addColorStop(1, "#0a0a0a");
+        ctx.fillStyle = dg;
         ctx.beginPath(); ctx.arc(dx, dy, 5, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = stats.accentColor;
-        ctx.beginPath(); ctx.arc(dx, dy, 3.5, 0, Math.PI * 2); ctx.fill();
-        // drone wings
-        ctx.strokeStyle = "#1a1a1a"; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(dx - 4, dy); ctx.lineTo(dx + 4, dy); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(dx, dy - 4); ctx.lineTo(dx, dy + 4); ctx.stroke();
+        ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 0.8;
+        ctx.beginPath(); ctx.arc(dx, dy, 5, 0, Math.PI * 2); ctx.stroke();
+        // rotor blur
+        ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1;
+        const rotorAngle = (performance.now() / 30) % (Math.PI * 2);
+        ctx.beginPath();
+        ctx.moveTo(dx + Math.cos(rotorAngle) * 6, dy + Math.sin(rotorAngle) * 6);
+        ctx.lineTo(dx - Math.cos(rotorAngle) * 6, dy - Math.sin(rotorAngle) * 6);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(dx + Math.cos(rotorAngle + Math.PI / 2) * 6, dy + Math.sin(rotorAngle + Math.PI / 2) * 6);
+        ctx.lineTo(dx - Math.cos(rotorAngle + Math.PI / 2) * 6, dy - Math.sin(rotorAngle + Math.PI / 2) * 6);
+        ctx.stroke();
       }
 
       ctx.globalAlpha = 1;
@@ -1399,34 +1486,45 @@ export default function Game({ map, onExit }: Props) {
       else if (def.hidden) ctx.globalAlpha = 0.55;
       if (e.invuln) ctx.globalAlpha = 0.35;
 
+      // shadow
+      const shg = ctx.createRadialGradient(e.pos.x, e.pos.y + def.radius * 0.6, 1, e.pos.x, e.pos.y + def.radius * 0.6, def.radius + 4);
+      shg.addColorStop(0, "rgba(0,0,0,0.4)"); shg.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = shg;
+      ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y + def.radius * 0.6, def.radius + 4, 0, Math.PI * 2); ctx.fill();
+
       ctx.fillStyle = def.outline;
       drawShape(ctx, e.pos.x, e.pos.y, def.radius + 2, def.shape ?? "circle");
       ctx.fill();
-      ctx.fillStyle = def.color;
+      // body radial gradient
+      const bg = ctx.createRadialGradient(e.pos.x - def.radius * 0.4, e.pos.y - def.radius * 0.4, 1, e.pos.x, e.pos.y, def.radius);
+      bg.addColorStop(0, lighten(def.color, 30));
+      bg.addColorStop(0.6, def.color);
+      bg.addColorStop(1, darken(def.color, 25));
+      ctx.fillStyle = bg;
       drawShape(ctx, e.pos.x, e.pos.y, def.radius, def.shape ?? "circle");
       ctx.fill();
+      // top highlight
+      ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.radius - 1, -Math.PI * 0.85, -Math.PI * 0.25); ctx.stroke();
+
       if (def.armored) {
         ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 1.5;
         drawShape(ctx, e.pos.x, e.pos.y, def.radius - 3, def.shape ?? "circle");
         ctx.stroke();
       }
-      // shielded marker
       if (e.kind === "shielded") {
         ctx.strokeStyle = "#fff"; ctx.lineWidth = 2.5;
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.radius + 3, -Math.PI / 2 - 0.6, -Math.PI / 2 + 0.6); ctx.stroke();
       }
-      // healer cross
       if (e.kind === "healer") {
         ctx.fillStyle = "#fff";
         ctx.fillRect(e.pos.x - 4, e.pos.y - 1, 8, 2);
         ctx.fillRect(e.pos.x - 1, e.pos.y - 4, 2, 8);
       }
-      // regen plus glow
       if (def.regen) {
         ctx.strokeStyle = "#22c55e"; ctx.lineWidth = 1.5;
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.radius + 3, 0, Math.PI * 2); ctx.stroke();
       }
-      // berserker spikes
       if (e.kind === "berserker") {
         ctx.fillStyle = "#ff5050";
         for (let i = 0; i < 4; i++) {
@@ -1438,7 +1536,6 @@ export default function Game({ map, onExit }: Props) {
           ctx.closePath(); ctx.fill();
         }
       }
-      // EMP drone arc
       if (e.kind === "empdrone" || e.kind === "bossemp") {
         ctx.strokeStyle = "#fff37a"; ctx.lineWidth = 1;
         ctx.beginPath();
@@ -1449,24 +1546,20 @@ export default function Game({ map, onExit }: Props) {
         }
         ctx.stroke();
       }
-      // aegis aura ring
       if (def.aegisAura) {
         const pulse = 0.3 + Math.sin(performance.now() / 300) * 0.15;
         ctx.strokeStyle = `rgba(154,223,255,${pulse})`; ctx.lineWidth = 2;
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.aegisAura.range, 0, Math.PI * 2); ctx.stroke();
       }
-      // healer aura ring
       if (def.healAura) {
         ctx.strokeStyle = "rgba(34,197,94,0.25)"; ctx.lineWidth = 1;
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.healAura.range, 0, Math.PI * 2); ctx.stroke();
       }
-      // cloak aura ring
       if (def.cloakAura) {
         ctx.strokeStyle = "rgba(80,80,80,0.4)"; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.cloakAura.range, 0, Math.PI * 2); ctx.stroke();
         ctx.setLineDash([]);
       }
-      // boss skull marker
       if (def.shape === "skull") {
         ctx.fillStyle = "#fff";
         ctx.beginPath(); ctx.arc(e.pos.x - 4, e.pos.y - 2, 3, 0, Math.PI * 2); ctx.fill();
@@ -1475,14 +1568,15 @@ export default function Game({ map, onExit }: Props) {
         ctx.beginPath(); ctx.arc(e.pos.x - 4, e.pos.y - 2, 1.5, 0, Math.PI * 2); ctx.fill();
         ctx.beginPath(); ctx.arc(e.pos.x + 4, e.pos.y - 2, 1.5, 0, Math.PI * 2); ctx.fill();
       }
-      // burn flicker
       if (e.burnUntil > nowSec()) {
-        for (let i = 0; i < 2; i++) {
-          ctx.fillStyle = i ? "#ff8a3d" : "#ffae40";
+        ctx.save(); ctx.globalCompositeOperation = "lighter";
+        for (let i = 0; i < 3; i++) {
+          ctx.fillStyle = i % 2 ? "#ff8a3d" : "#ffae40";
           const fx = e.pos.x + (Math.random() - 0.5) * def.radius;
           const fy = e.pos.y - def.radius + (Math.random() - 0.5) * 4;
           ctx.beginPath(); ctx.arc(fx, fy, 2, 0, Math.PI * 2); ctx.fill();
         }
+        ctx.restore();
       }
       ctx.restore();
 
@@ -1491,7 +1585,6 @@ export default function Game({ map, onExit }: Props) {
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.radius + 4, 0, Math.PI * 2); ctx.stroke();
       }
 
-      // health bar
       const w = def.radius * 2 + 4;
       const pct = Math.max(0, e.hp / e.maxHp);
       ctx.fillStyle = "rgba(0,0,0,0.7)";
@@ -1501,12 +1594,10 @@ export default function Game({ map, onExit }: Props) {
 
       if (def.shape === "skull" || e.kind === "juggernaut") {
         ctx.fillStyle = "#fff";
-        ctx.font = "bold 10px Inter, sans-serif";
-        ctx.textAlign = "center";
+        ctx.font = "bold 10px Inter, sans-serif"; ctx.textAlign = "center";
         ctx.fillText(def.name.toUpperCase(), e.pos.x, e.pos.y - def.radius - 14);
       }
 
-      // hover highlight
       if (hoveredEnemyIdRef.current === e.id) {
         ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]);
         ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.radius + 7, 0, Math.PI * 2); ctx.stroke();
@@ -1515,53 +1606,56 @@ export default function Game({ map, onExit }: Props) {
     };
 
     const render = (ctx: CanvasRenderingContext2D) => {
+      // DPR-aware transform: drawing in W,H logical -> scaled to canvas pixels
+      ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+
+      // bg
       ctx.fillStyle = map.bgColor;
       ctx.fillRect(0, 0, W, H);
-      for (const d of map.decorations) {
-        ctx.globalAlpha = d.opacity ?? 1;
-        if (d.kind === "rect") {
-          ctx.fillStyle = d.color; ctx.fillRect(d.x, d.y, d.w, d.h);
-          if (d.stroke) { ctx.strokeStyle = d.stroke; ctx.lineWidth = 1; ctx.strokeRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1); }
-          else { ctx.strokeStyle = "rgba(255,255,255,0.05)"; ctx.lineWidth = 1; ctx.strokeRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1); }
-        } else if (d.kind === "circle") {
-          ctx.fillStyle = d.color; ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2); ctx.fill();
-        } else if (d.kind === "line") {
-          ctx.strokeStyle = d.color; ctx.lineWidth = d.width;
-          if (d.dash) ctx.setLineDash(d.dash); else ctx.setLineDash([]);
-          ctx.beginPath(); ctx.moveTo(d.x1, d.y1); ctx.lineTo(d.x2, d.y2); ctx.stroke();
-          ctx.setLineDash([]);
-        } else if (d.kind === "text") {
-          ctx.fillStyle = d.color; ctx.font = `bold ${d.size}px Inter, sans-serif`; ctx.textAlign = "left";
-          ctx.fillText(d.text, d.x, d.y);
-        }
-        ctx.globalAlpha = 1;
-      }
-      ctx.strokeStyle = "rgba(255,255,255,0.025)"; ctx.lineWidth = 1;
-      for (let x = 0; x <= W; x += CELL) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
-      for (let y = 0; y <= H; y += CELL) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+      // subtle vignette
+      const vg = ctx.createRadialGradient(W / 2, H / 2, 200, W / 2, H / 2, 600);
+      vg.addColorStop(0, "rgba(0,0,0,0)"); vg.addColorStop(1, "rgba(0,0,0,0.45)");
+      ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
 
+      drawDecorations(ctx, map.decorations);
+      drawNoBuildZones(ctx);
+
+      // path
       const wp = map.waypoints;
       ctx.lineCap = "round"; ctx.lineJoin = "round";
-      ctx.strokeStyle = map.pathOutline; ctx.lineWidth = 44;
+      ctx.strokeStyle = map.pathOutline; ctx.lineWidth = map.pathOutlineWidth ?? 44;
       ctx.beginPath(); ctx.moveTo(wp[0].x, wp[0].y);
       for (let i = 1; i < wp.length; i++) ctx.lineTo(wp[i].x, wp[i].y);
       ctx.stroke();
-      ctx.strokeStyle = map.pathColor; ctx.lineWidth = 36;
+      ctx.strokeStyle = map.pathColor; ctx.lineWidth = map.pathWidth ?? 36;
       ctx.beginPath(); ctx.moveTo(wp[0].x, wp[0].y);
       for (let i = 1; i < wp.length; i++) ctx.lineTo(wp[i].x, wp[i].y);
       ctx.stroke();
-      const stripe = map.centerStripe ?? { color: "rgba(255,255,255,0.18)", dash: [6, 8] as [number, number], width: 2 };
-      ctx.strokeStyle = stripe.color; ctx.lineWidth = stripe.width;
-      ctx.setLineDash(stripe.dash);
+      // path stripe
+      ctx.strokeStyle = map.pathStripeColor ?? "rgba(255,255,255,0.18)"; ctx.lineWidth = map.pathStripeWidth ?? 2;
+      ctx.setLineDash(map.pathStripeDash ?? [8, 10]);
       ctx.beginPath(); ctx.moveTo(wp[0].x, wp[0].y);
       for (let i = 1; i < wp.length; i++) ctx.lineTo(wp[i].x, wp[i].y);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      ctx.stroke(); ctx.setLineDash([]);
 
-      ctx.fillStyle = "#f5f5f5";
-      ctx.beginPath(); ctx.arc(wp[0].x, wp[0].y, 12, 0, Math.PI * 2); ctx.fill();
+      // draw "top decorations" (overpasses / bridges) over the path
+      if (map.topDecorations) drawDecorations(ctx, map.topDecorations);
+
+      // entrance / exit markers
+      ctx.fillStyle = "#0a0a0a";
+      ctx.beginPath(); ctx.arc(wp[0].x, wp[0].y, 14, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#e8e8ec";
+      ctx.beginPath(); ctx.arc(wp[0].x, wp[0].y, 11, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#0a0a0a";
+      ctx.beginPath(); ctx.arc(wp[wp.length - 1].x, wp[wp.length - 1].y, 14, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = "#dc2626";
-      ctx.beginPath(); ctx.arc(wp[wp.length - 1].x, wp[wp.length - 1].y, 12, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(wp[wp.length - 1].x, wp[wp.length - 1].y, 11, 0, Math.PI * 2); ctx.fill();
+      // entry arrow
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 8px Inter, sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("IN", wp[0].x, wp[0].y + 3);
+      ctx.fillText("OUT", wp[wp.length - 1].x, wp[wp.length - 1].y + 3);
 
       // mines
       for (const m of minesRef.current) {
@@ -1569,7 +1663,6 @@ export default function Game({ map, onExit }: Props) {
         ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 5, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = "#dc2626";
         ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 2, 0, Math.PI * 2); ctx.fill();
-        // pulse
         const pulse = (Math.sin(performance.now() / 250) + 1) / 2;
         ctx.strokeStyle = `rgba(220,38,38,${0.3 + pulse * 0.4})`; ctx.lineWidth = 1;
         ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 7, 0, Math.PI * 2); ctx.stroke();
@@ -1598,9 +1691,10 @@ export default function Game({ map, onExit }: Props) {
         if (m.x > 0 && m.x < W) {
           const def = TOWERS[sk];
           const onPath = isOnPath(m, map.waypoints, 24);
+          const inZone = inNoBuildZone(m, map.noBuildZones);
           let overlap = false;
           for (const t of towersRef.current) if (dist(t.pos, m) < 30) overlap = true;
-          const ok = !onPath && !overlap && moneyRef.current >= def.cost;
+          const ok = !onPath && !inZone && !overlap && moneyRef.current >= def.cost;
           if ((def.base.range ?? 0) > 0) {
             ctx.fillStyle = ok ? "rgba(220,38,38,0.10)" : "rgba(255,80,80,0.15)";
             ctx.strokeStyle = ok ? "rgba(220,38,38,0.6)" : "rgba(255,80,80,0.6)";
@@ -1611,35 +1705,29 @@ export default function Game({ map, onExit }: Props) {
             id: -1, kind: sk, pos: m, pathIdx: null, tier: 0,
             cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null, aimAngle: 0,
             incomeTimer: 0, mineTimer: 0, drones: [], stunUntil: 0,
-          }, 0.65);
+          }, ok ? 0.7 : 0.45);
         }
       }
 
       for (const t of towersRef.current) drawTower(ctx, t, 1);
       for (const e of enemiesRef.current) drawEnemy(ctx, e);
 
-      // beams (railgun)
+      // beams
       for (const b of beamsRef.current) {
         const a = Math.min(1, b.ttl * 6);
-        ctx.strokeStyle = b.color;
-        ctx.globalAlpha = a;
-        ctx.lineWidth = b.width;
+        ctx.save(); ctx.globalCompositeOperation = "lighter";
+        ctx.strokeStyle = b.color; ctx.globalAlpha = a; ctx.lineWidth = b.width;
         ctx.beginPath(); ctx.moveTo(b.from.x, b.from.y); ctx.lineTo(b.to.x, b.to.y); ctx.stroke();
-        ctx.lineWidth = b.width * 2;
-        ctx.globalAlpha = a * 0.3;
-        ctx.stroke();
-        ctx.globalAlpha = 1;
+        ctx.lineWidth = b.width * 2.5; ctx.globalAlpha = a * 0.3;
+        ctx.stroke(); ctx.restore();
       }
 
       // projectiles
       for (const p of projectilesRef.current) {
         ctx.fillStyle = p.color;
         ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2); ctx.fill();
-        if (p.size >= 4) {
-          ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 1; ctx.stroke();
-        }
+        if (p.size >= 4) { ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 1; ctx.stroke(); }
         if (p.arc) {
-          // shadow on ground
           ctx.fillStyle = "rgba(0,0,0,0.4)";
           ctx.beginPath(); ctx.ellipse(p.arc.startX + (p.arc.targetX - p.arc.startX) * (p.arc.t / p.arc.total), p.arc.startY + (p.arc.targetY - p.arc.startY) * (p.arc.t / p.arc.total), 4, 2, 0, 0, Math.PI * 2); ctx.fill();
         }
@@ -1647,6 +1735,7 @@ export default function Game({ map, onExit }: Props) {
 
       // zaps
       for (const z of zapsRef.current) {
+        ctx.save(); ctx.globalCompositeOperation = "lighter";
         ctx.strokeStyle = `rgba(255,243,122,${Math.min(1, z.ttl * 6)})`;
         ctx.lineWidth = 3;
         ctx.beginPath();
@@ -1655,37 +1744,47 @@ export default function Game({ map, onExit }: Props) {
           const a = z.points[i - 1], b = z.points[i];
           const mx = (a.x + b.x) / 2 + (Math.random() - 0.5) * 14;
           const my = (a.y + b.y) / 2 + (Math.random() - 0.5) * 14;
-          ctx.lineTo(mx, my);
-          ctx.lineTo(b.x, b.y);
+          ctx.lineTo(mx, my); ctx.lineTo(b.x, b.y);
         }
-        ctx.stroke();
+        ctx.stroke(); ctx.restore();
       }
 
-      // particles
+      // particles — additive groups separately
+      ctx.save();
       for (const p of particlesRef.current) {
         const lifeRatio = p.ttl / p.maxTtl;
         ctx.globalAlpha = Math.max(0, lifeRatio);
+        ctx.globalCompositeOperation = p.blend ? "lighter" : "source-over";
         if (p.kind === "muzzle") {
-          ctx.fillStyle = p.color;
+          const grad = ctx.createRadialGradient(p.pos.x, p.pos.y, 0, p.pos.x, p.pos.y, p.size * lifeRatio);
+          grad.addColorStop(0, p.color); grad.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = grad;
           ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size * lifeRatio, 0, Math.PI * 2); ctx.fill();
         } else if (p.kind === "smoke") {
           ctx.fillStyle = p.color;
           ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size * (1 + (1 - lifeRatio)), 0, Math.PI * 2); ctx.fill();
         } else if (p.kind === "explosion") {
-          ctx.fillStyle = p.color;
+          const grad = ctx.createRadialGradient(p.pos.x, p.pos.y, 0, p.pos.x, p.pos.y, p.size);
+          grad.addColorStop(0, "#fffae0"); grad.addColorStop(0.5, p.color); grad.addColorStop(1, "rgba(255,80,40,0)");
+          ctx.fillStyle = grad;
           ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size * (1.2 - lifeRatio * 0.4), 0, Math.PI * 2); ctx.fill();
         } else if (p.kind === "ring") {
           ctx.strokeStyle = p.color; ctx.lineWidth = 3;
           ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size * (1 - lifeRatio * 0.6), 0, Math.PI * 2); ctx.stroke();
-        } else if (p.kind === "spark") {
+        } else if (p.kind === "spark" || p.kind === "ember") {
           ctx.fillStyle = p.color;
           ctx.fillRect(p.pos.x - p.size / 2, p.pos.y - p.size / 2, p.size, p.size);
         } else if (p.kind === "fire") {
-          ctx.fillStyle = p.color;
+          const grad = ctx.createRadialGradient(p.pos.x, p.pos.y, 0, p.pos.x, p.pos.y, p.size * (0.7 + lifeRatio * 0.6));
+          grad.addColorStop(0, p.color); grad.addColorStop(1, "rgba(255,80,30,0)");
+          ctx.fillStyle = grad;
           ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size * (0.5 + lifeRatio * 0.7), 0, Math.PI * 2); ctx.fill();
+        } else if (p.kind === "dust") {
+          ctx.fillStyle = p.color;
+          ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2); ctx.fill();
         }
       }
-      ctx.globalAlpha = 1;
+      ctx.restore();
 
       if (placementErrorRef.current) {
         const pe = placementErrorRef.current;
@@ -1702,7 +1801,7 @@ export default function Game({ map, onExit }: Props) {
       }
 
       if (waveAnnounce) {
-        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
         ctx.fillRect(0, H / 2 - 40, W, 80);
         ctx.fillStyle = "#fff";
         ctx.font = "bold 36px Inter, sans-serif"; ctx.textAlign = "center";
@@ -1728,12 +1827,11 @@ export default function Game({ map, onExit }: Props) {
       canvas.removeEventListener("click", onClick);
       canvas.removeEventListener("mouseleave", onLeave);
     };
-  }, [map, tryPlaceTower, waveAnnounce]);
+  }, [map, tryPlaceTower, waveAnnounce, startWave]);
 
   const selectedTower = selectedTowerId != null ? towersRef.current.find(t => t.id === selectedTowerId) : null;
   const hoveredEnemy = hoveredEnemyId != null ? enemiesRef.current.find(e => e.id === hoveredEnemyId) : null;
 
-  // intel level from any recon tower
   const intelLevel: number = (() => {
     let best = 0;
     for (const t of towersRef.current) {
@@ -1749,7 +1847,7 @@ export default function Game({ map, onExit }: Props) {
     zapsRef.current = []; floatersRef.current = []; particlesRef.current = [];
     waveRef.current = null;
     setLives(100); livesRef.current = 100;
-    setMoney(1000); moneyRef.current = 1000;
+    setMoney(700); moneyRef.current = 700;
     setLevel(1); levelRef.current = 1;
     setWaveActive(false); waveActiveRef.current = false;
     setSelectedKind(null); setSelectedTowerId(null);
@@ -1760,14 +1858,16 @@ export default function Game({ map, onExit }: Props) {
 
   return (
     <div className="h-screen w-screen flex flex-col bg-background">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-card">
-        <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-gradient-to-b from-card to-background">
+        <div className="flex items-center gap-3">
           <Button variant="ghost" size="sm" onClick={onExit} className="rounded-sm">
             <Home className="w-4 h-4 mr-1" /> Menu
           </Button>
-          <span className="text-sm text-muted-foreground tracking-wide">{map.name}</span>
-          <span className="text-xs text-muted-foreground">·</span>
-          <span className="text-xs text-foreground font-mono">{playerName}</span>
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-muted-foreground tracking-wide">{map.name}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="text-foreground font-mono text-xs px-1.5 py-0.5 bg-muted rounded-sm">{playerName}</span>
+          </div>
         </div>
         <div className="flex items-center gap-5">
           <Stat icon={<Heart className="w-4 h-4 text-primary" />} value={lives} label="Lives" />
@@ -1775,6 +1875,14 @@ export default function Game({ map, onExit }: Props) {
           <Stat icon={<Trophy className="w-4 h-4 text-primary" />} value={`${level} / 30`} label="Wave" />
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            variant="outline" size="sm"
+            onClick={() => setAutoWave(a => !a)}
+            className={`rounded-sm ${autoWave ? "border-primary text-primary" : ""}`}
+            title="Auto-deploy next wave when current ends"
+          >
+            <Repeat className="w-4 h-4 mr-1" /> Auto {autoWave ? "ON" : "OFF"}
+          </Button>
           <Button variant={waveActive ? "secondary" : "default"} size="sm" onClick={startWave} disabled={waveActive || !!gameOver} className="rounded-sm">
             <Play className="w-4 h-4 mr-1" />
             {waveActive ? "Wave Active" : `Deploy Wave ${level}`}
@@ -1793,33 +1901,24 @@ export default function Game({ map, onExit }: Props) {
           <div className="relative" style={{ aspectRatio: `${W} / ${H}`, width: "100%", maxWidth: "100%", maxHeight: "100%" }}>
             <canvas
               ref={canvasRef}
-              width={W}
-              height={H}
               className="w-full h-full rounded-sm shadow-2xl border border-border cursor-crosshair"
+              style={{ imageRendering: "auto" }}
             />
-            {/* Hover tooltip */}
-            {hoveredEnemy && (
-              <EnemyTooltip enemy={hoveredEnemy} />
-            )}
-            {/* Hint bar */}
-            <div className="absolute bottom-2 left-2 text-[10px] text-muted-foreground bg-card/80 px-2 py-1 rounded-sm font-mono">
+            {hoveredEnemy && <EnemyTooltip enemy={hoveredEnemy} />}
+            <div className="absolute bottom-2 left-2 text-[10px] text-muted-foreground bg-card/80 backdrop-blur px-2 py-1 rounded-sm font-mono border border-border/50">
               [1-9] tower · [Esc] cancel · [Space] wave · [P] pause
             </div>
             {gameOver && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/80 rounded-sm">
-                <div className="bg-card border border-border p-6 rounded-sm text-center max-w-sm">
+              <div className="absolute inset-0 flex items-center justify-center bg-black/85 rounded-sm">
+                <div className="bg-card border border-border p-6 rounded-sm text-center max-w-sm shadow-2xl">
                   {gameOver === "win" ? (
-                    <>
-                      <Crown className="w-12 h-12 mx-auto text-primary mb-2" />
+                    <><Crown className="w-12 h-12 mx-auto text-primary mb-2" />
                       <h2 className="text-2xl font-bold mb-1">VICTORY</h2>
-                      <p className="text-muted-foreground mb-4">All 30 waves repelled on {map.name}.</p>
-                    </>
+                      <p className="text-muted-foreground mb-4">All 30 waves repelled on {map.name}.</p></>
                   ) : (
-                    <>
-                      <Skull className="w-12 h-12 mx-auto text-primary mb-2" />
+                    <><Skull className="w-12 h-12 mx-auto text-primary mb-2" />
                       <h2 className="text-2xl font-bold mb-1">DEFEATED</h2>
-                      <p className="text-muted-foreground mb-4">The line broke on wave {level}.</p>
-                    </>
+                      <p className="text-muted-foreground mb-4">The line broke on wave {level}.</p></>
                   )}
                   <div className="flex gap-2 justify-center">
                     <Button onClick={restart} className="rounded-sm">Retry</Button>
@@ -1832,9 +1931,14 @@ export default function Game({ map, onExit }: Props) {
         </div>
 
         <div className="w-80 border-l border-border bg-card flex flex-col">
-          <div className="p-3 border-b border-border max-h-[55%] overflow-y-auto">
-            <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-2">Build Tower</div>
-            <div className="grid grid-cols-1 gap-1.5">
+          <div className="px-3 pt-3 pb-2 border-b border-border">
+            <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center justify-between">
+              <span>Build Tower</span>
+              <span className="text-[9px] text-muted-foreground/60 normal-case tracking-wide">click to select · click map to place</span>
+            </div>
+          </div>
+          <div className="px-2 py-2 max-h-[55%] overflow-y-auto">
+            <div className="grid grid-cols-1 gap-1">
               {TOWER_ORDER.map((k, idx) => {
                 const def = TOWERS[k];
                 const canAfford = money >= def.cost;
@@ -1845,21 +1949,21 @@ export default function Game({ map, onExit }: Props) {
                     key={k}
                     onClick={() => { setSelectedKind(selected ? null : k); setSelectedTowerId(null); }}
                     disabled={!canAfford}
-                    className={`text-left p-2 rounded-sm border transition-colors ${
-                      selected ? "border-primary bg-primary/10" : "border-border hover:border-primary/50"
+                    className={`text-left px-2 py-1.5 rounded-sm border transition-all ${
+                      selected ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(220,38,38,0.3)]" : "border-border/60 hover:border-primary/50 hover:bg-muted/30"
                     } ${!canAfford ? "opacity-50 cursor-not-allowed" : ""}`}
                   >
                     <div className="flex items-center gap-2">
-                      <TowerIcon kind={k} stats={def.base} />
+                      <TowerKindIcon kind={k} />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5">
-                          <div className="text-sm font-semibold">{def.name}</div>
+                          <div className="text-xs font-bold tracking-tight">{def.name}</div>
                           <DamageBadge type={def.base.damageType} />
-                          {keyHint && <span className="text-[9px] font-mono bg-muted px-1 rounded-sm text-muted-foreground">{keyHint}</span>}
+                          {keyHint && <span className="ml-auto text-[9px] font-mono bg-muted px-1 rounded-sm text-muted-foreground">{keyHint}</span>}
                         </div>
-                        <div className="text-[11px] text-muted-foreground leading-tight truncate">{def.description}</div>
+                        <div className="text-[10px] text-muted-foreground leading-tight truncate">{def.description}</div>
                       </div>
-                      <div className="flex items-center text-xs text-foreground font-mono">
+                      <div className="flex items-center text-[11px] text-foreground font-mono font-bold">
                         <Coins className="w-3 h-3 mr-0.5 text-muted-foreground" />{def.cost}
                       </div>
                     </div>
@@ -1877,16 +1981,16 @@ export default function Game({ map, onExit }: Props) {
               onSell={() => sellTower(selectedTower.id)}
             />
           ) : (
-            <div className="p-3 flex-1 overflow-y-auto">
+            <div className="p-3 flex-1 overflow-y-auto border-t border-border">
               <ThreatPanel level={level} intelLevel={intelLevel} />
-              <div className="mt-4 pt-3 border-t border-border text-[11px] text-muted-foreground leading-relaxed">
-                Hover any visible enemy to inspect its stats. Press <span className="font-mono bg-muted px-1 rounded-sm">Esc</span> to cancel placement, <span className="font-mono bg-muted px-1 rounded-sm">Space</span> to deploy the next wave.
+              <div className="mt-4 pt-3 border-t border-border text-[10px] text-muted-foreground leading-relaxed">
+                Hover any visible enemy to inspect stats. Auto-wave deploys the next wave 4s after the current ends.
               </div>
-              <div className="mt-4 pt-3 border-t border-border">
-                <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-2">Damage Types</div>
-                <div className="space-y-1 text-[11px]">
+              <div className="mt-3 pt-3 border-t border-border">
+                <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2">Damage Types</div>
+                <div className="grid grid-cols-2 gap-1 text-[10px]">
                   {(Object.keys(DAMAGE_LABELS) as DamageType[]).map(d => (
-                    <div key={d} className="flex items-center gap-2">
+                    <div key={d} className="flex items-center gap-1.5">
                       <div className="w-2 h-2 rounded-full" style={{ background: DAMAGE_LABELS[d].color }} />
                       <span className="text-muted-foreground">{DAMAGE_LABELS[d].label}</span>
                     </div>
@@ -1901,11 +2005,60 @@ export default function Game({ map, onExit }: Props) {
   );
 }
 
+// ============================================================
+// Helper components
+// ============================================================
+
+function lighten(hex: string, amt: number): string {
+  const c = parseHex(hex);
+  return rgb(Math.min(255, c.r + amt), Math.min(255, c.g + amt), Math.min(255, c.b + amt));
+}
+function darken(hex: string, amt: number): string {
+  const c = parseHex(hex);
+  return rgb(Math.max(0, c.r - amt), Math.max(0, c.g - amt), Math.max(0, c.b - amt));
+}
+function parseHex(hex: string): { r: number; g: number; b: number } {
+  const h = hex.replace("#", "");
+  const full = h.length === 3 ? h.split("").map(c => c + c).join("") : h;
+  return { r: parseInt(full.slice(0, 2), 16), g: parseInt(full.slice(2, 4), 16), b: parseInt(full.slice(4, 6), 16) };
+}
+function rgb(r: number, g: number, b: number): string {
+  return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0")).join("");
+}
+
+function TowerKindIcon({ kind }: { kind: TowerKind }) {
+  const def = TOWERS[kind];
+  const Icon =
+    kind === "rifleman" ? Crosshair :
+    kind === "frost" ? Snowflake :
+    kind === "sniper" ? Target :
+    kind === "tesla" ? Zap :
+    kind === "flame" ? Flame :
+    kind === "drone" ? Plane :
+    kind === "howitzer" ? Bomb :
+    kind === "mortar" ? Bomb :
+    kind === "railgun" ? Zap :
+    kind === "minelayer" ? AlertTriangle :
+    kind === "engineer" ? Wrench :
+    kind === "recon" ? Radar :
+    kind === "bank" ? DollarSign :
+    Crosshair;
+  const stats = def.base;
+  return (
+    <div
+      className="w-7 h-7 rounded-sm flex-shrink-0 flex items-center justify-center border"
+      style={{ background: stats.bodyColor, borderColor: stats.accentColor }}
+    >
+      <Icon className="w-3.5 h-3.5" style={{ color: stats.accentColor }} />
+    </div>
+  );
+}
+
 function EnemyTooltip({ enemy }: { enemy: Enemy }) {
   const def = ENEMIES[enemy.kind];
   return (
     <div
-      className="absolute pointer-events-none bg-card/95 border border-primary rounded-sm p-2 text-xs shadow-2xl z-10 min-w-[200px]"
+      className="absolute pointer-events-none bg-card/95 backdrop-blur border border-primary rounded-sm p-2 text-xs shadow-2xl z-10 min-w-[210px]"
       style={{ left: `${(enemy.pos.x / W) * 100}%`, top: `${(enemy.pos.y / H) * 100}%`, transform: "translate(20px, -50%)" }}
     >
       <div className="flex items-center gap-1.5 mb-1">
@@ -1966,7 +2119,7 @@ function ThreatPanel({ level, intelLevel }: { level: number; intelLevel: number 
   const wave = generateWave(level);
   return (
     <>
-      <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-2 flex items-center gap-2">
+      <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center gap-2">
         <span>Wave {level} Threats</span>
         {intelLevel > 0 && <span className="text-[9px] text-cyan-400 normal-case tracking-normal flex items-center gap-1"><Radar className="w-3 h-3" />Intel L{intelLevel}</span>}
       </div>
@@ -1975,20 +2128,19 @@ function ThreatPanel({ level, intelLevel }: { level: number; intelLevel: number 
       <div className="space-y-1 text-xs">
         {wave.spawns.map((s, i) => {
           const ed = ENEMIES[s.kind];
-          let countText: string = "?";
+          let countText = "?";
           if (intelLevel >= 2) countText = `×${s.count}`;
           else if (intelLevel === 1) {
             const lo = Math.max(1, Math.floor(s.count * 0.7));
             const hi = Math.ceil(s.count * 1.3);
             countText = `×${lo}-${hi}`;
-          } else countText = "?";
+          }
           return (
             <div key={i} className="flex items-center gap-2">
               <div className="w-3 h-3" style={{ background: ed.color, borderRadius: ed.shape === "diamond" ? 0 : 999, transform: ed.shape === "diamond" ? "rotate(45deg)" : undefined }} />
               <span className="text-muted-foreground flex-1">{ed.name}</span>
               {ed.hidden && <Eye className="w-3 h-3 text-amber-400" />}
               {ed.armored && <Shield className="w-3 h-3 text-zinc-300" />}
-              {ed.summon && <ZapIcon className="w-3 h-3 text-primary" />}
               <span className="font-mono text-[10px] text-foreground">{countText}</span>
             </div>
           );
@@ -2007,12 +2159,12 @@ function TowerPanel({ tower, money, onUpgrade, onSell }: { tower: Tower; money: 
     : def.name;
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="p-3 border-b border-border">
+    <div className="flex-1 overflow-y-auto border-t border-border">
+      <div className="p-3 border-b border-border bg-gradient-to-b from-muted/20 to-transparent">
         <div className="flex items-center gap-2 mb-2">
-          <TowerIcon kind={tower.kind} stats={stats} />
+          <TowerKindIcon kind={tower.kind} />
           <div className="flex-1">
-            <div className="text-sm font-semibold flex items-center gap-1.5">
+            <div className="text-sm font-bold flex items-center gap-1.5">
               {currentName}
               {stats.hiddenDetect && <Eye className="w-3 h-3 text-amber-400" />}
             </div>
@@ -2070,7 +2222,7 @@ function TowerPanel({ tower, money, onUpgrade, onSell }: { tower: Tower; money: 
       </div>
 
       <div className="p-3">
-        <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-2">Upgrade Paths</div>
+        <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2">Choose Upgrade Path</div>
         {def.paths.map((path, pIdx) => {
           const locked = tower.pathIdx !== null && tower.pathIdx !== pIdx;
           const isPath = tower.pathIdx === pIdx;
@@ -2080,12 +2232,12 @@ function TowerPanel({ tower, money, onUpgrade, onSell }: { tower: Tower; money: 
             <div
               key={pIdx}
               className={`mb-2 p-2 rounded-sm border ${
-                isPath ? "border-primary bg-primary/5" : locked ? "border-border opacity-50" : "border-border"
+                isPath ? "border-primary bg-primary/5 shadow-[0_0_0_1px_rgba(220,38,38,0.2)]" : locked ? "border-border opacity-40" : "border-border hover:border-border/80"
               }`}
             >
               <div className="flex items-center justify-between mb-1">
                 <div>
-                  <div className="text-sm font-semibold">{path.name}</div>
+                  <div className="text-sm font-bold">{path.name}</div>
                   <div className="text-[10px] text-muted-foreground">{path.tagline}</div>
                 </div>
                 <div className="flex gap-0.5">
@@ -2124,22 +2276,6 @@ function TowerPanel({ tower, money, onUpgrade, onSell }: { tower: Tower; money: 
   );
 }
 
-function TowerIcon({ kind, stats }: { kind: TowerKind; stats: TowerStats }) {
-  const Icon =
-    kind === "bank" ? DollarSign :
-    kind === "recon" ? Radar :
-    kind === "engineer" ? Wrench :
-    kind === "flame" ? Flame :
-    kind === "mortar" ? Bomb :
-    kind === "minelayer" ? Bomb :
-    null;
-  return (
-    <div className="w-7 h-7 rounded-sm flex-shrink-0 flex items-center justify-center" style={{ background: stats.bodyColor, boxShadow: `inset 0 0 0 1.5px ${stats.accentColor}` }}>
-      {Icon && <Icon className="w-3.5 h-3.5" style={{ color: stats.accentColor }} />}
-    </div>
-  );
-}
-
 function Stat({ icon, value, label }: { icon: React.ReactNode; value: number | string; label: string }) {
   return (
     <div className="flex items-center gap-1.5">
@@ -2173,4 +2309,3 @@ function DamageBadge({ type }: { type: DamageType }) {
     </span>
   );
 }
-

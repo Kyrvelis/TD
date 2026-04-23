@@ -9,17 +9,20 @@ type Screen = "menu" | "maps" | "game";
 function App() {
   const [screen, setScreen] = useState<Screen>("menu");
   const [selectedMap, setSelectedMap] = useState<MapDef | null>(null);
-  const [mpToast, setMpToast] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 2400); };
 
   if (screen === "menu") return (
     <>
       <MainMenu
         onSinglePlayer={() => setScreen("maps")}
-        onMultiplayer={() => { setMpToast(true); setTimeout(() => setMpToast(false), 2400); }}
+        onMultiplayer={() => showToast("Multiplayer is coming in the next update.")}
+        onMapCreator={() => showToast("The map creator is coming in a future update.")}
       />
-      {mpToast && (
+      {toast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-card border border-primary px-4 py-2 rounded-sm text-sm shadow-xl">
-          Multiplayer is coming in the next update.
+          {toast}
         </div>
       )}
     </>

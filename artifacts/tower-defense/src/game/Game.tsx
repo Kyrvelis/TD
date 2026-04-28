@@ -3,14 +3,17 @@ import { Button } from "@/components/ui/button";
 import {
   Heart, Coins, Trophy, Play, FastForward, Pause, Home, Crown, Skull, Eye, Shield, ChevronRight,
   Radar, Wrench, DollarSign, Flame, Bomb, Crosshair, Snowflake, Target, Zap, Plane, AlertTriangle,
-  Repeat,
+  Repeat, EyeOff, HelpCircle, Users,
 } from "lucide-react";
 import {
   TOWERS, TOWER_ORDER, ENEMIES, generateWave, effectiveStats, upgradeCostFor, totalSpent, DAMAGE_LABELS,
   type MapDef, type Point, type TowerKind, type EnemyKind, type WaveSpawn, type DamageType, type TowerStats, type NoBuildZone,
 } from "./data";
+import type { MultiplayerMode, AIDifficulty } from "@/screens/MultiplayerLobby";
 
 const W = 800, H = 500;
+const STARTING_LIVES = 100;
+const STARTING_MONEY = 700;
 
 type Enemy = {
   id: number;
@@ -93,7 +96,35 @@ type Particle = {
   blend?: boolean;
 };
 
-type Props = { map: MapDef; onExit: () => void };
+type Lane = {
+  idx: number;
+  isPlayer: boolean;       // true for the human's lane
+  team: 0 | 1;             // 0 = player team, 1 = opponent team
+  name: string;
+  alive: boolean;
+  ai: null | { difficulty: AIDifficulty; planCd: number; upgradeCd: number; preferredKinds: TowerKind[] };
+  enemies: Enemy[];
+  towers: Tower[];
+  projectiles: Projectile[];
+  mines: Mine[];
+  beams: Beam[];
+  zaps: Zap[];
+  floaters: Floater[];
+  particles: Particle[];
+  wave: { spawns: WaveSpawn[]; hpMul: number; spawned: number[]; timers: number[]; active: boolean; bossKind?: EnemyKind } | null;
+  lives: number;
+  money: number;
+  waveActive: boolean;
+};
+
+export type GameMode = "solo" | MultiplayerMode;
+
+type Props = {
+  map: MapDef;
+  mode: GameMode;
+  difficulty?: AIDifficulty;
+  onExit: () => void;
+};
 
 function dist(a: Point, b: Point) { const dx = a.x - b.x, dy = a.y - b.y; return Math.sqrt(dx * dx + dy * dy); }
 
@@ -146,23 +177,107 @@ function applyResistance(dmg: number, type: DamageType, e: Enemy): number {
   return dmg;
 }
 
-export default function Game({ map, onExit }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+const BOSS_KINDS = new Set<EnemyKind>(["miniboss", "boss", "bossbrute", "bossemp", "bossaegis", "bossnecro", "bosscloaker", "bossfinal"]);
+const MAJOR_BOSS_KINDS = new Set<EnemyKind>(["boss", "bossemp", "bossaegis", "bossnecro", "bosscloaker", "bossfinal"]);
 
-  const enemiesRef = useRef<Enemy[]>([]);
-  const towersRef = useRef<Tower[]>([]);
-  const projectilesRef = useRef<Projectile[]>([]);
-  const minesRef = useRef<Mine[]>([]);
-  const beamsRef = useRef<Beam[]>([]);
-  const zapsRef = useRef<Zap[]>([]);
-  const floatersRef = useRef<Floater[]>([]);
-  const particlesRef = useRef<Particle[]>([]);
+// Boss damage scaling: minibosses ~40+wave, bosses ~60+wave, final ~90+wave
+function scaledBossDamage(kind: EnemyKind, baseDamage: number, level: number): number {
+  if (!BOSS_KINDS.has(kind)) return baseDamage;
+  const isMajor = MAJOR_BOSS_KINDS.has(kind);
+  const scale = Math.floor((level - 1) / 5);
+  if (kind === "bossfinal") return baseDamage + scale * 8;
+  return baseDamage + scale * (isMajor ? 6 : 4);
+}
+
+// Deterministic visibility hash for opponent towers based on intel level
+function towerRevealed(towerId: number, intelLevel: number): boolean {
+  if (intelLevel >= 3) return true;
+  if (intelLevel <= 0) return false;
+  const h = (towerId * 2654435761) >>> 0;
+  const pct = (h % 100) / 100;
+  return pct < (intelLevel === 1 ? 0.3 : 0.6);
+}
+
+function lighten(hex: string, amt: number): string {
+  const c = parseHex(hex);
+  return rgb(Math.min(255, c.r + amt), Math.min(255, c.g + amt), Math.min(255, c.b + amt));
+}
+function darken(hex: string, amt: number): string {
+  const c = parseHex(hex);
+  return rgb(Math.max(0, c.r - amt), Math.max(0, c.g - amt), Math.max(0, c.b - amt));
+}
+function parseHex(hex: string): { r: number; g: number; b: number } {
+  const h = hex.replace("#", "");
+  const full = h.length === 3 ? h.split("").map(c => c + c).join("") : h;
+  return { r: parseInt(full.slice(0, 2), 16), g: parseInt(full.slice(2, 4), 16), b: parseInt(full.slice(4, 6), 16) };
+}
+function rgb(r: number, g: number, b: number): string {
+  return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0")).join("");
+}
+
+// AI tower preferences, weighted picks per difficulty
+const AI_KIT: Record<AIDifficulty, TowerKind[]> = {
+  rookie:  ["rifleman", "rifleman", "rifleman", "frost", "sniper", "bank", "howitzer"],
+  veteran: ["rifleman", "frost", "sniper", "howitzer", "tesla", "drone", "bank", "engineer", "recon", "minelayer"],
+  elite:   ["rifleman", "frost", "sniper", "howitzer", "tesla", "drone", "bank", "engineer", "recon", "minelayer", "mortar", "railgun", "flame"],
+};
+
+const SUPPORT_KIT: TowerKind[] = ["bank", "bank", "engineer", "recon", "frost", "drone"];
+
+function aiThinkInterval(d: AIDifficulty): number {
+  if (d === "rookie") return 4.5;
+  if (d === "veteran") return 2.8;
+  return 1.6;
+}
+
+function makeLane(idx: number, isPlayer: boolean, team: 0 | 1, name: string, ai: AIDifficulty | null, isSupport = false): Lane {
+  return {
+    idx, isPlayer, team, name, alive: true,
+    ai: ai ? {
+      difficulty: ai,
+      planCd: 1.5 + Math.random() * 1.0,
+      upgradeCd: 6 + Math.random() * 3,
+      preferredKinds: isSupport ? SUPPORT_KIT : AI_KIT[ai],
+    } : null,
+    enemies: [], towers: [], projectiles: [], mines: [], beams: [], zaps: [], floaters: [], particles: [],
+    wave: null,
+    lives: STARTING_LIVES,
+    money: STARTING_MONEY,
+    waveActive: false,
+  };
+}
+
+function makeLanes(mode: GameMode, difficulty: AIDifficulty, playerName: string): Lane[] {
+  if (mode === "solo") {
+    return [makeLane(0, true, 0, playerName, null)];
+  }
+  if (mode === "1v1") {
+    return [
+      makeLane(0, true, 0, playerName, null),
+      makeLane(1, false, 1, "AI Adversary", difficulty),
+    ];
+  }
+  // 2v2
+  return [
+    makeLane(0, true, 0, playerName, null),
+    makeLane(1, false, 0, "AI Ally", "veteran", true),
+    makeLane(2, false, 1, "AI Adversary 1", difficulty),
+    makeLane(3, false, 1, "AI Adversary 2", difficulty),
+  ];
+}
+
+export default function Game({ map, mode, difficulty = "veteran", onExit }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const idCounter = useRef(1);
   const mouseRef = useRef<Point>({ x: -100, y: -100 });
   const placementErrorRef = useRef<{ pos: Point; ttl: number } | null>(null);
 
-  const [lives, setLives] = useState(100);
-  const [money, setMoney] = useState(700);
+  const playerName = (typeof window !== "undefined" && localStorage.getItem("bulwark.name")) || "Commander";
+
+  const lanesRef = useRef<Lane[]>(makeLanes(mode, difficulty, playerName));
+
+  const [, forceTick] = useState(0);
+
   const [level, setLevel] = useState(1);
   const [waveActive, setWaveActive] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -170,18 +285,11 @@ export default function Game({ map, onExit }: Props) {
   const [autoWave, setAutoWave] = useState(false);
   const [selectedKind, setSelectedKind] = useState<TowerKind | null>(null);
   const [selectedTowerId, setSelectedTowerId] = useState<number | null>(null);
-  const [, forceTick] = useState(0);
   const [gameOver, setGameOver] = useState<null | "win" | "lose">(null);
   const [waveAnnounce, setWaveAnnounce] = useState<string | null>(null);
   const [hoveredEnemyId, setHoveredEnemyId] = useState<number | null>(null);
+  const [viewedLaneIdx, setViewedLaneIdx] = useState(0);
 
-  const waveRef = useRef<{
-    spawns: WaveSpawn[]; hpMul: number; spawned: number[]; timers: number[]; active: boolean; bossKind?: EnemyKind;
-  } | null>(null);
-  const autoWaveTimerRef = useRef(0);
-
-  const livesRef = useRef(lives);
-  const moneyRef = useRef(money);
   const levelRef = useRef(level);
   const pausedRef = useRef(paused);
   const speedRef = useRef(speed);
@@ -191,9 +299,9 @@ export default function Game({ map, onExit }: Props) {
   const selectedKindRef = useRef<TowerKind | null>(null);
   const gameOverRef = useRef<null | "win" | "lose">(null);
   const hoveredEnemyIdRef = useRef<number | null>(null);
+  const viewedLaneIdxRef = useRef(viewedLaneIdx);
+  const autoWaveTimerRef = useRef(0);
 
-  useEffect(() => { livesRef.current = lives; }, [lives]);
-  useEffect(() => { moneyRef.current = money; }, [money]);
   useEffect(() => { levelRef.current = level; }, [level]);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
@@ -203,55 +311,80 @@ export default function Game({ map, onExit }: Props) {
   useEffect(() => { selectedKindRef.current = selectedKind; }, [selectedKind]);
   useEffect(() => { gameOverRef.current = gameOver; }, [gameOver]);
   useEffect(() => { hoveredEnemyIdRef.current = hoveredEnemyId; }, [hoveredEnemyId]);
+  useEffect(() => { viewedLaneIdxRef.current = viewedLaneIdx; }, [viewedLaneIdx]);
+
+  const playerLane = () => lanesRef.current[0];
+  const viewedLane = () => lanesRef.current[viewedLaneIdxRef.current] ?? lanesRef.current[0];
+
+  const playerIntelLevel = (): number => {
+    let best = 0;
+    for (const t of playerLane().towers) {
+      const s = effectiveStats(TOWERS[t.kind], t.pathIdx, t.tier);
+      if ((s.intelLevel ?? 0) > best) best = s.intelLevel ?? 0;
+    }
+    return best;
+  };
 
   const startWave = useCallback(() => {
     if (waveActiveRef.current || gameOverRef.current) return;
     const lvl = levelRef.current;
     const wave = generateWave(lvl);
-    waveRef.current = {
-      spawns: wave.spawns, hpMul: wave.hpMul,
-      spawned: wave.spawns.map(() => 0),
-      timers: wave.spawns.map(() => 0),
-      active: true, bossKind: wave.bossKind,
-    };
+    for (const lane of lanesRef.current) {
+      if (!lane.alive) continue;
+      lane.wave = {
+        spawns: wave.spawns, hpMul: wave.hpMul,
+        spawned: wave.spawns.map(() => 0),
+        timers: wave.spawns.map(() => 0),
+        active: true, bossKind: wave.bossKind,
+      };
+      lane.waveActive = true;
+    }
     setWaveActive(true);
+    waveActiveRef.current = true;
     autoWaveTimerRef.current = 0;
     const tag = wave.isBoss ? `BOSS WAVE ${lvl}` : wave.isMiniBoss ? `MINI-BOSS WAVE ${lvl}` : `WAVE ${lvl}`;
     setWaveAnnounce(tag);
     setTimeout(() => setWaveAnnounce(null), 1800);
   }, []);
 
-  const tryPlaceTower = useCallback((kind: TowerKind, p: Point) => {
-    if (gameOverRef.current) return;
+  const tryPlaceTower = useCallback((kind: TowerKind, p: Point, lane: Lane): boolean => {
+    if (gameOverRef.current) return false;
+    if (!lane.alive) return false;
     const def = TOWERS[kind];
-    const reject = () => { placementErrorRef.current = { pos: p, ttl: 1.0 }; };
-    if (moneyRef.current < def.cost) return reject();
-    if (isOnPath(p, map.waypoints, 24)) return reject();
-    if (inNoBuildZone(p, map.noBuildZones)) return reject();
-    for (const t of towersRef.current) if (dist(t.pos, p) < 30) return reject();
-    if (p.x < 18 || p.x > W - 18 || p.y < 18 || p.y > H - 18) return reject();
+    if (lane.money < def.cost) return false;
+    if (isOnPath(p, map.waypoints, 24)) return false;
+    if (inNoBuildZone(p, map.noBuildZones)) return false;
+    for (const t of lane.towers) if (dist(t.pos, p) < 30) return false;
+    if (p.x < 18 || p.x > W - 18 || p.y < 18 || p.y > H - 18) return false;
     const drones: Drone[] = [];
     const baseDrones = def.base.droneCount ?? 0;
     for (let i = 0; i < baseDrones; i++) drones.push({ angle: (i / baseDrones) * Math.PI * 2, cooldown: 0, target: null });
-    towersRef.current.push({
+    lane.towers.push({
       id: idCounter.current++, kind, pos: { ...p }, pathIdx: null, tier: 0,
       cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null, aimAngle: 0,
       incomeTimer: 0, mineTimer: 0, drones, stunUntil: 0,
     });
-    setMoney(m => m - def.cost);
-    moneyRef.current -= def.cost;
+    lane.money -= def.cost;
+    return true;
   }, [map.waypoints, map.noBuildZones]);
 
+  const tryPlaceTowerByPlayer = useCallback((kind: TowerKind, p: Point) => {
+    const lane = playerLane();
+    const ok = tryPlaceTower(kind, p, lane);
+    if (!ok) placementErrorRef.current = { pos: p, ttl: 1.0 };
+    forceTick(x => x + 1);
+  }, [tryPlaceTower]);
+
   const upgradeTower = useCallback((id: number, pathIdx: number) => {
-    const t = towersRef.current.find(t => t.id === id);
+    const lane = playerLane();
+    const t = lane.towers.find(t => t.id === id);
     if (!t) return;
     if (t.pathIdx !== null && t.pathIdx !== pathIdx) return;
     const def = TOWERS[t.kind];
     const cost = upgradeCostFor(def, pathIdx, t.tier);
     if (cost === null) return;
-    if (moneyRef.current < cost) return;
-    moneyRef.current -= cost;
-    setMoney(m => m - cost);
+    if (lane.money < cost) return;
+    lane.money -= cost;
     if (t.pathIdx === null) t.pathIdx = pathIdx;
     t.tier += 1;
     const newStats = effectiveStats(def, t.pathIdx, t.tier);
@@ -262,15 +395,16 @@ export default function Game({ map, onExit }: Props) {
   }, []);
 
   const sellTower = useCallback((id: number) => {
-    const idx = towersRef.current.findIndex(t => t.id === id);
+    const lane = playerLane();
+    const idx = lane.towers.findIndex(t => t.id === id);
     if (idx < 0) return;
-    const t = towersRef.current[idx];
+    const t = lane.towers[idx];
     const def = TOWERS[t.kind];
     const value = Math.round(totalSpent(def, t.pathIdx, t.tier) * 0.65);
-    moneyRef.current += value;
-    setMoney(m => m + value);
-    towersRef.current.splice(idx, 1);
+    lane.money += value;
+    lane.towers.splice(idx, 1);
     setSelectedTowerId(null);
+    forceTick(x => x + 1);
   }, []);
 
   // ===== Keybinds =====
@@ -280,6 +414,11 @@ export default function Game({ map, onExit }: Props) {
       if (e.key === "Escape") { setSelectedKind(null); setSelectedTowerId(null); return; }
       if (e.key === " " && !waveActiveRef.current) { e.preventDefault(); startWave(); return; }
       if (e.key.toLowerCase() === "p") { setPaused(p => !p); return; }
+      if (e.key.toLowerCase() === "v" && lanesRef.current.length > 1) {
+        setViewedLaneIdx(i => (i + 1) % lanesRef.current.length);
+        setSelectedTowerId(null);
+        return;
+      }
       const numKey = parseInt(e.key, 10);
       if (!isNaN(numKey) && numKey >= 1 && numKey <= 9) {
         const idx = numKey - 1;
@@ -326,10 +465,10 @@ export default function Game({ map, onExit }: Props) {
     let raf = 0;
     let last = performance.now();
 
-    const cloakKnown = (en: Enemy) => {
+    const cloakKnown = (lane: Lane, en: Enemy) => {
       const def = ENEMIES[en.kind];
       if (!def.hidden) return true;
-      for (const t of towersRef.current) {
+      for (const t of lane.towers) {
         const ts = effectiveStats(TOWERS[t.kind], t.pathIdx, t.tier);
         if (ts.hiddenDetect) {
           if ((ts.intelLevel ?? 0) >= 3) return true;
@@ -345,11 +484,12 @@ export default function Game({ map, onExit }: Props) {
         x: ((e.clientX - r.left) / r.width) * W,
         y: ((e.clientY - r.top) / r.height) * H,
       };
+      const lane = viewedLane();
       let found: number | null = null;
-      for (const en of enemiesRef.current) {
+      for (const en of lane.enemies) {
         if (!en.alive) continue;
         const def = ENEMIES[en.kind];
-        if (def.hidden && !cloakKnown(en)) continue;
+        if (def.hidden && !cloakKnown(lane, en)) continue;
         if (dist(en.pos, mouseRef.current) <= def.radius + 4) { found = en.id; break; }
       }
       if (found !== hoveredEnemyIdRef.current) setHoveredEnemyId(found);
@@ -357,13 +497,16 @@ export default function Game({ map, onExit }: Props) {
     const onClick = (e: MouseEvent) => {
       const r = canvas.getBoundingClientRect();
       const p = { x: ((e.clientX - r.left) / r.width) * W, y: ((e.clientY - r.top) / r.height) * H };
-      for (const t of towersRef.current) {
+      const isOwn = viewedLaneIdxRef.current === 0;
+      if (!isOwn) return; // can't interact with opponent lanes
+      const lane = playerLane();
+      for (const t of lane.towers) {
         if (dist(t.pos, p) < 18) {
           setSelectedTowerId(t.id); setSelectedKind(null); return;
         }
       }
       const k = selectedKindRef.current;
-      if (k) tryPlaceTower(k, p);
+      if (k) tryPlaceTowerByPlayer(k, p);
       else setSelectedTowerId(null);
     };
     const onLeave = () => { mouseRef.current = { x: -100, y: -100 }; setHoveredEnemyId(null); };
@@ -379,7 +522,7 @@ export default function Game({ map, onExit }: Props) {
       return t + e.segT;
     };
 
-    const spawnEnemy = (kind: EnemyKind, hpMul: number, atPos?: Point) => {
+    const spawnEnemy = (lane: Lane, kind: EnemyKind, hpMul: number, atPos?: Point) => {
       const def = ENEMIES[kind];
       const start = atPos ?? map.waypoints[0];
       let segIdx = 0, segT = 0;
@@ -396,22 +539,24 @@ export default function Game({ map, onExit }: Props) {
         t = Math.max(0, Math.min(1, t));
         segT = Math.sqrt(l2) * t;
       }
-      enemiesRef.current.push({
+      const lvl = levelRef.current;
+      lane.enemies.push({
         id: idCounter.current++, kind,
         hp: def.baseHp * hpMul, maxHp: def.baseHp * hpMul,
         pos: { ...start }, segIdx, segT,
         speedMul: 1, slowUntil: 0,
-        reward: Math.round(def.reward * Math.pow(1.04, levelRef.current - 1)),
-        damage: def.damage, alive: true, summonTimer: 0,
+        reward: Math.round(def.reward * Math.pow(1.04, lvl - 1)),
+        damage: scaledBossDamage(kind, def.damage, lvl),
+        alive: true, summonTimer: 0,
         burnTimer: 0, burnDps: 0, burnUntil: 0,
         phaseTimer: 0, invuln: false,
         cloakedUntil: 0, empTimer: 0, healTimer: 0,
       });
     };
 
-    const aegisMul = (target: Enemy): number => {
+    const aegisMul = (lane: Lane, target: Enemy): number => {
       let mul = 1;
-      for (const e of enemiesRef.current) {
+      for (const e of lane.enemies) {
         if (!e.alive) continue;
         const def = ENEMIES[e.kind];
         if (def.aegisAura && dist(e.pos, target.pos) <= def.aegisAura.range) mul = Math.min(mul, def.aegisAura.resist);
@@ -419,14 +564,30 @@ export default function Game({ map, onExit }: Props) {
       return mul;
     };
 
-    const damageEnemy = (e: Enemy, dmg: number, type: DamageType, slowFactor?: number, slowDuration?: number, burnDps?: number, burnDuration?: number) => {
+    const grantMoney = (lane: Lane, amt: number, src: Point | null) => {
+      lane.money += amt;
+      if (src) lane.floaters.push({ text: `+${amt}`, pos: { ...src }, ttl: 0.8, color: "#dc2626" });
+      // Team income split (2v2): teammates also get 50%
+      if (mode === "2v2") {
+        for (const ally of lanesRef.current) {
+          if (ally.idx === lane.idx) continue;
+          if (ally.team !== lane.team) continue;
+          if (!ally.alive) continue;
+          const share = Math.round(amt * 0.5);
+          ally.money += share;
+          ally.floaters.push({ text: `+${share} ally`, pos: { x: 80, y: 60 }, ttl: 1.0, color: "#fff37a" });
+        }
+      }
+    };
+
+    const damageEnemy = (lane: Lane, e: Enemy, dmg: number, type: DamageType, slowFactor?: number, slowDuration?: number, burnDps?: number, burnDuration?: number) => {
       if (!e.alive) return;
       if (e.invuln) {
-        floatersRef.current.push({ text: "IMMUNE", pos: { ...e.pos }, ttl: 0.6, color: "#aa44ff" });
+        lane.floaters.push({ text: "IMMUNE", pos: { ...e.pos }, ttl: 0.6, color: "#aa44ff" });
         return;
       }
       let eff = applyResistance(dmg, type, e);
-      eff *= aegisMul(e);
+      eff *= aegisMul(lane, e);
       e.hp -= eff;
       if (slowFactor && slowDuration) {
         e.speedMul = Math.min(e.speedMul, slowFactor);
@@ -438,17 +599,15 @@ export default function Game({ map, onExit }: Props) {
       }
       if (e.hp <= 0) {
         e.alive = false;
-        moneyRef.current += e.reward;
-        setMoney(m => m + e.reward);
-        floatersRef.current.push({ text: `+${e.reward}`, pos: { ...e.pos }, ttl: 0.8, color: "#dc2626" });
+        grantMoney(lane, e.reward, e.pos);
         const def = ENEMIES[e.kind];
         if (def.necroOnDeath) {
-          for (let i = 0; i < def.necroOnDeath.count; i++) spawnEnemy(def.necroOnDeath.kind, hpMulNow() * 0.5, e.pos);
+          for (let i = 0; i < def.necroOnDeath.count; i++) spawnEnemy(lane, def.necroOnDeath.kind, hpMulOf(lane) * 0.5, e.pos);
         }
         for (let i = 0; i < 8; i++) {
           const ang = Math.random() * Math.PI * 2;
           const sp = 30 + Math.random() * 80;
-          particlesRef.current.push({
+          lane.particles.push({
             pos: { ...e.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp },
             ttl: 0.5, maxTtl: 0.5, size: 2 + Math.random() * 2,
             color: ENEMIES[e.kind].color, kind: "smoke",
@@ -457,13 +616,13 @@ export default function Game({ map, onExit }: Props) {
       }
     };
 
-    const hpMulNow = () => waveRef.current?.hpMul ?? 1;
+    const hpMulOf = (lane: Lane) => lane.wave?.hpMul ?? 1;
 
-    const enemyVisibleToTower = (e: Enemy, hiddenDetect: boolean, _towerPos: Point) => {
+    const enemyVisibleToTower = (lane: Lane, e: Enemy, hiddenDetect: boolean, _towerPos: Point) => {
       const def = ENEMIES[e.kind];
       if (def.hidden && !hiddenDetect) return false;
       if (!hiddenDetect) {
-        for (const c of enemiesRef.current) {
+        for (const c of lane.enemies) {
           if (!c.alive || c === e) continue;
           const cdef = ENEMIES[c.kind];
           if (cdef.cloakAura && dist(c.pos, e.pos) <= cdef.cloakAura.range) return false;
@@ -472,12 +631,12 @@ export default function Game({ map, onExit }: Props) {
       return true;
     };
 
-    const pickTarget = (pos: Point, range: number, hiddenDetect: boolean): Enemy | null => {
+    const pickTarget = (lane: Lane, pos: Point, range: number, hiddenDetect: boolean): Enemy | null => {
       let best: Enemy | null = null;
       let bestProgress = -1;
-      for (const e of enemiesRef.current) {
+      for (const e of lane.enemies) {
         if (!e.alive) continue;
-        if (!enemyVisibleToTower(e, hiddenDetect, pos)) continue;
+        if (!enemyVisibleToTower(lane, e, hiddenDetect, pos)) continue;
         if (dist(e.pos, pos) > range) continue;
         let prog = 0;
         for (let i = 0; i < e.segIdx; i++) prog += dist(map.waypoints[i], map.waypoints[i + 1]);
@@ -487,21 +646,21 @@ export default function Game({ map, onExit }: Props) {
       return best;
     };
 
-    const pickNearest = (pos: Point, range: number, exclude: Set<number>, hiddenDetect: boolean): Enemy | null => {
+    const pickNearest = (lane: Lane, pos: Point, range: number, exclude: Set<number>, hiddenDetect: boolean): Enemy | null => {
       let best: Enemy | null = null;
       let bestD = Infinity;
-      for (const e of enemiesRef.current) {
+      for (const e of lane.enemies) {
         if (!e.alive || exclude.has(e.id)) continue;
-        if (!enemyVisibleToTower(e, hiddenDetect, pos)) continue;
+        if (!enemyVisibleToTower(lane, e, hiddenDetect, pos)) continue;
         const d = dist(e.pos, pos);
         if (d < range && d < bestD) { bestD = d; best = e; }
       }
       return best;
     };
 
-    const buffsFor = (t: Tower): { fireRate: number; damage: number } => {
+    const buffsFor = (lane: Lane, t: Tower): { fireRate: number; damage: number } => {
       let fr = 1, dm = 1;
-      for (const o of towersRef.current) {
+      for (const o of lane.towers) {
         if (o.id === t.id) continue;
         const os = effectiveStats(TOWERS[o.kind], o.pathIdx, o.tier);
         if (os.buffAura && dist(o.pos, t.pos) <= os.buffAura.range) {
@@ -512,30 +671,28 @@ export default function Game({ map, onExit }: Props) {
       return { fireRate: fr, damage: dm };
     };
 
-    const fireBullet = (t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
+    const fireBullet = (lane: Lane, t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
       const ang = Math.atan2(target.pos.y - t.pos.y, target.pos.x - t.pos.x);
       t.aimAngle = ang;
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
-      // muzzle flash particles
-      particlesRef.current.push({
+      lane.particles.push({
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         ttl: 0.1, maxTtl: 0.1, size: 9, color: "#fff5b0", kind: "muzzle", blend: true,
       });
       for (let i = 0; i < 4; i++) {
         const sa = ang + (Math.random() - 0.5) * 0.7;
         const sp = 100 + Math.random() * 140;
-        particlesRef.current.push({
+        lane.particles.push({
           pos: { x: bx, y: by }, vel: { x: Math.cos(sa) * sp, y: Math.sin(sa) * sp },
           ttl: 0.25, maxTtl: 0.25, size: 1.5, color: "#ffd070", kind: "spark", blend: true,
         });
       }
-      // barrel smoke
-      particlesRef.current.push({
+      lane.particles.push({
         pos: { x: bx, y: by }, vel: { x: Math.cos(ang) * 20, y: Math.sin(ang) * 20 - 10 },
         ttl: 0.5, maxTtl: 0.5, size: 4, color: "rgba(180,180,180,0.6)", kind: "smoke",
       });
-      projectilesRef.current.push({
+      lane.projectiles.push({
         id: idCounter.current++,
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         target, targetPos: { ...target.pos },
@@ -546,7 +703,7 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    const fireFlame = (t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
+    const fireFlame = (lane: Lane, t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
       const ang = Math.atan2(target.pos.y - t.pos.y, target.pos.x - t.pos.x);
       t.aimAngle = ang;
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
@@ -554,14 +711,14 @@ export default function Game({ map, onExit }: Props) {
       for (let i = 0; i < 7; i++) {
         const sa = ang + (Math.random() - 0.5) * 0.55;
         const sp = 200 + Math.random() * 220;
-        particlesRef.current.push({
+        lane.particles.push({
           pos: { x: bx, y: by }, vel: { x: Math.cos(sa) * sp, y: Math.sin(sa) * sp },
           ttl: 0.4, maxTtl: 0.4, size: 4 + Math.random() * 3,
           color: i % 3 === 0 ? "#ff6020" : i % 3 === 1 ? "#ff8a3d" : "#ffae40",
           kind: "fire", blend: true,
         });
       }
-      projectilesRef.current.push({
+      lane.projectiles.push({
         id: idCounter.current++,
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         target, targetPos: { ...target.pos },
@@ -572,15 +729,15 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    const fireGrenade = (t: Tower, target: Enemy, ub: { interval: number; damage: number; splashRadius: number }, dmgMul: number) => {
+    const fireGrenade = (lane: Lane, t: Tower, target: Enemy, ub: { interval: number; damage: number; splashRadius: number }, dmgMul: number) => {
       const ang = Math.atan2(target.pos.y - t.pos.y, target.pos.x - t.pos.x);
       const bx = t.pos.x + Math.cos(ang) * 14;
       const by = t.pos.y + Math.sin(ang) * 14;
-      particlesRef.current.push({
+      lane.particles.push({
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         ttl: 0.2, maxTtl: 0.2, size: 12, color: "rgba(140,140,140,0.7)", kind: "smoke",
       });
-      projectilesRef.current.push({
+      lane.projectiles.push({
         id: idCounter.current++,
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         target, targetPos: { ...target.pos },
@@ -590,24 +747,24 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    const fireHowitzer = (t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
+    const fireHowitzer = (lane: Lane, t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
       const ang = Math.atan2(target.pos.y - t.pos.y, target.pos.x - t.pos.x);
       t.aimAngle = ang;
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
-      particlesRef.current.push({
+      lane.particles.push({
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         ttl: 0.22, maxTtl: 0.22, size: 24, color: "#ffae40", kind: "muzzle", blend: true,
       });
       for (let i = 0; i < 10; i++) {
         const sa = ang + (Math.random() - 0.5) * 1.2;
         const sp = 30 + Math.random() * 100;
-        particlesRef.current.push({
+        lane.particles.push({
           pos: { x: bx, y: by }, vel: { x: Math.cos(sa) * sp, y: Math.sin(sa) * sp },
           ttl: 0.7, maxTtl: 0.7, size: 6 + Math.random() * 4, color: "rgba(120,120,120,0.7)", kind: "smoke",
         });
       }
-      projectilesRef.current.push({
+      lane.projectiles.push({
         id: idCounter.current++,
         pos: { x: bx, y: by }, vel: { x: 0, y: 0 },
         target, targetPos: { ...target.pos },
@@ -617,14 +774,14 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    const fireMortar = (t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
+    const fireMortar = (lane: Lane, t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
       t.aimAngle = -Math.PI / 2;
-      particlesRef.current.push({
+      lane.particles.push({
         pos: { ...t.pos }, vel: { x: 0, y: 0 },
         ttl: 0.25, maxTtl: 0.25, size: 16, color: "#ffae40", kind: "muzzle", blend: true,
       });
       const total = dist(t.pos, target.pos) / stats.projectileSpeed + 0.4;
-      projectilesRef.current.push({
+      lane.projectiles.push({
         id: idCounter.current++,
         pos: { ...t.pos }, vel: { x: 0, y: 0 },
         target: null, targetPos: { ...target.pos },
@@ -635,15 +792,15 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    const fireRailgun = (t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
+    const fireRailgun = (lane: Lane, t: Tower, target: Enemy, stats: TowerStats, dmgMul: number) => {
       const ang = Math.atan2(target.pos.y - t.pos.y, target.pos.x - t.pos.x);
       t.aimAngle = ang;
       const farX = t.pos.x + Math.cos(ang) * Math.max(stats.range, 1000);
       const farY = t.pos.y + Math.sin(ang) * Math.max(stats.range, 1000);
       const hits: Enemy[] = [];
-      for (const e of enemiesRef.current) {
+      for (const e of lane.enemies) {
         if (!e.alive) continue;
-        if (!enemyVisibleToTower(e, !!stats.hiddenDetect, t.pos)) continue;
+        if (!enemyVisibleToTower(lane, e, !!stats.hiddenDetect, t.pos)) continue;
         if (dist(e.pos, t.pos) > stats.range + 50) continue;
         if (distToSeg(e.pos, t.pos, { x: farX, y: farY }) <= ENEMIES[e.kind].radius + 6) hits.push(e);
       }
@@ -653,60 +810,60 @@ export default function Game({ map, onExit }: Props) {
       const finalPoint = actualHits.length > 0
         ? actualHits[actualHits.length - 1].pos
         : { x: t.pos.x + Math.cos(ang) * stats.range, y: t.pos.y + Math.sin(ang) * stats.range };
-      beamsRef.current.push({ from: { ...t.pos }, to: { ...finalPoint }, color: stats.projectileColor, width: 4, ttl: 0.18 });
+      lane.beams.push({ from: { ...t.pos }, to: { ...finalPoint }, color: stats.projectileColor, width: 4, ttl: 0.18 });
       const bx = t.pos.x + Math.cos(ang) * stats.barrelLength;
       const by = t.pos.y + Math.sin(ang) * stats.barrelLength;
-      particlesRef.current.push({ pos: { x: bx, y: by }, vel: { x: 0, y: 0 }, ttl: 0.2, maxTtl: 0.2, size: 18, color: stats.projectileColor, kind: "muzzle", blend: true });
-      for (const h of actualHits) damageEnemy(h, stats.damage * dmgMul, stats.damageType);
+      lane.particles.push({ pos: { x: bx, y: by }, vel: { x: 0, y: 0 }, ttl: 0.2, maxTtl: 0.2, size: 18, color: stats.projectileColor, kind: "muzzle", blend: true });
+      for (const h of actualHits) damageEnemy(lane, h, stats.damage * dmgMul, stats.damageType);
     };
 
-    const triggerExplosion = (pos: Point, radius: number, damage: number, type: DamageType, slowFactor?: number, slowDuration?: number) => {
-      particlesRef.current.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.55, maxTtl: 0.55, size: radius, color: "#ef4444", kind: "ring", blend: true });
-      particlesRef.current.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.3, maxTtl: 0.3, size: radius * 0.75, color: "#fff5b0", kind: "explosion", blend: true });
+    const triggerExplosion = (lane: Lane, pos: Point, radius: number, damage: number, type: DamageType, slowFactor?: number, slowDuration?: number) => {
+      lane.particles.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.55, maxTtl: 0.55, size: radius, color: "#ef4444", kind: "ring", blend: true });
+      lane.particles.push({ pos: { ...pos }, vel: { x: 0, y: 0 }, ttl: 0.3, maxTtl: 0.3, size: radius * 0.75, color: "#fff5b0", kind: "explosion", blend: true });
       for (let i = 0; i < 18; i++) {
         const ang = Math.random() * Math.PI * 2;
         const sp = 60 + Math.random() * 240;
-        particlesRef.current.push({
+        lane.particles.push({
           pos: { ...pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp },
           ttl: 0.5, maxTtl: 0.5, size: 2 + Math.random() * 3,
           color: i < 8 ? "#ffae40" : "rgba(110,110,110,0.7)",
           kind: i < 8 ? "ember" : "smoke", blend: i < 8,
         });
       }
-      for (const e of enemiesRef.current) {
+      for (const e of lane.enemies) {
         if (!e.alive) continue;
-        if (dist(e.pos, pos) <= radius) damageEnemy(e, damage, type, slowFactor, slowDuration);
+        if (dist(e.pos, pos) <= radius) damageEnemy(lane, e, damage, type, slowFactor, slowDuration);
       }
     };
 
-    const layMine = (t: Tower, stats: TowerStats, dmgMul: number) => {
+    const layMine = (lane: Lane, t: Tower, stats: TowerStats, dmgMul: number) => {
       const wp = map.waypoints;
       const candidates: Point[] = [];
       for (let i = 0; i < wp.length - 1; i++) {
         const a = wp[i], b = wp[i + 1];
         const len = dist(a, b);
-        const step = 25;
-        for (let s = 0; s <= len; s += step) {
+        const stepLen = 25;
+        for (let s = 0; s <= len; s += stepLen) {
           const tt = s / len;
           const p = { x: a.x + (b.x - a.x) * tt, y: a.y + (b.y - a.y) * tt };
           if (dist(p, t.pos) <= stats.range) candidates.push(p);
         }
       }
       if (candidates.length === 0) return;
-      const filtered = candidates.filter(p => !minesRef.current.some(m => dist(m.pos, p) < 18));
+      const filtered = candidates.filter(p => !lane.mines.some(m => dist(m.pos, p) < 18));
       const pool = filtered.length > 0 ? filtered : candidates;
       const pick = pool[Math.floor(Math.random() * pool.length)];
-      minesRef.current.push({
+      lane.mines.push({
         pos: pick, damage: (stats.mineDamage ?? 50) * dmgMul, splash: stats.mineSplash ?? 40,
         slowFactor: stats.slowFactor, slowDuration: stats.slowDuration, ttl: 999,
       });
     };
 
-    const fireDrone = (t: Tower, drone: Drone, target: Enemy, stats: TowerStats, dmgMul: number) => {
+    const fireDrone = (lane: Lane, t: Tower, drone: Drone, target: Enemy, stats: TowerStats, dmgMul: number) => {
       const dronePos = { x: t.pos.x + Math.cos(drone.angle) * 32, y: t.pos.y + Math.sin(drone.angle) * 32 };
-      particlesRef.current.push({ pos: { ...dronePos }, vel: { x: 0, y: 0 }, ttl: 0.1, maxTtl: 0.1, size: 6, color: "#fff37a", kind: "muzzle", blend: true });
+      lane.particles.push({ pos: { ...dronePos }, vel: { x: 0, y: 0 }, ttl: 0.1, maxTtl: 0.1, size: 6, color: "#fff37a", kind: "muzzle", blend: true });
       const isExplosive = stats.damageType === "explosion";
-      projectilesRef.current.push({
+      lane.projectiles.push({
         id: idCounter.current++,
         pos: { ...dronePos }, vel: { x: 0, y: 0 },
         target, targetPos: { ...target.pos },
@@ -719,10 +876,102 @@ export default function Game({ map, onExit }: Props) {
       });
     };
 
-    const step = (dt: number) => {
-      if (dt <= 0) return;
+    // ==================================================
+    // AI brain: places towers, upgrades existing ones
+    // ==================================================
+    const aiPickPlacement = (lane: Lane, kind: TowerKind): Point | null => {
+      const def = TOWERS[kind];
+      // Sample candidate spots near path
+      let best: { p: Point; score: number } | null = null;
+      const wp = map.waypoints;
+      for (let attempt = 0; attempt < 60; attempt++) {
+        // pick a random point along path then offset perpendicular
+        const segIdx = Math.floor(Math.random() * (wp.length - 1));
+        const a = wp[segIdx], b = wp[segIdx + 1];
+        const tt = Math.random();
+        const px = a.x + (b.x - a.x) * tt;
+        const py = a.y + (b.y - a.y) * tt;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len, ny = dx / len;
+        const off = (Math.random() < 0.5 ? -1 : 1) * (38 + Math.random() * 60);
+        const p = { x: px + nx * off, y: py + ny * off };
+        if (p.x < 30 || p.x > W - 30 || p.y < 30 || p.y > H - 30) continue;
+        if (isOnPath(p, wp, 24)) continue;
+        if (inNoBuildZone(p, map.noBuildZones)) continue;
+        let overlap = false;
+        for (const t of lane.towers) if (dist(t.pos, p) < 34) { overlap = true; break; }
+        if (overlap) continue;
+        // Score: closer to path is better for combat, but bank/recon prefer back
+        const distToPath = Math.abs(off);
+        let score = 100 - distToPath;
+        if (kind === "bank" || kind === "recon") score = distToPath; // back placement
+        if (kind === "mortar") score += 20; // mortar can be far
+        score += Math.random() * 20;
+        if (!best || score > best.score) best = { p, score };
+      }
+      return best ? best.p : null;
+    };
 
-      const wave = waveRef.current;
+    const aiTick = (lane: Lane, dt: number) => {
+      if (!lane.ai || !lane.alive) return;
+      const ai = lane.ai;
+      ai.planCd -= dt;
+      ai.upgradeCd -= dt;
+
+      // Try to place a tower
+      if (ai.planCd <= 0) {
+        ai.planCd = aiThinkInterval(ai.difficulty) * (0.7 + Math.random() * 0.6);
+        // Affordability-aware pick
+        const affordable = ai.preferredKinds.filter(k => lane.money >= TOWERS[k].cost);
+        if (affordable.length > 0) {
+          // Prefer cheap if poor, expensive if rich
+          let kind: TowerKind;
+          if (lane.money >= 1500 && Math.random() < 0.4) {
+            const expensive = affordable.filter(k => TOWERS[k].cost >= 400);
+            kind = (expensive.length > 0 ? expensive : affordable)[Math.floor(Math.random() * (expensive.length > 0 ? expensive.length : affordable.length))];
+          } else {
+            kind = affordable[Math.floor(Math.random() * affordable.length)];
+          }
+          const spot = aiPickPlacement(lane, kind);
+          if (spot) tryPlaceTower(kind, spot, lane);
+        }
+      }
+      // Try to upgrade
+      if (ai.upgradeCd <= 0 && lane.towers.length > 0) {
+        ai.upgradeCd = aiThinkInterval(ai.difficulty) * 1.8 * (0.8 + Math.random() * 0.5);
+        // Pick a random tower we can upgrade
+        const candidates = lane.towers
+          .map(t => {
+            const def = TOWERS[t.kind];
+            if (t.tier >= 3) return null;
+            const pathIdx = t.pathIdx ?? (Math.random() < 0.5 ? 0 : 1);
+            const cost = upgradeCostFor(def, pathIdx, t.tier);
+            if (cost === null || lane.money < cost) return null;
+            return { t, pathIdx, cost };
+          })
+          .filter((x): x is { t: Tower; pathIdx: number; cost: number } => x !== null);
+        if (candidates.length > 0) {
+          const pick = candidates[Math.floor(Math.random() * candidates.length)];
+          lane.money -= pick.cost;
+          if (pick.t.pathIdx === null) pick.t.pathIdx = pick.pathIdx;
+          pick.t.tier += 1;
+          const def = TOWERS[pick.t.kind];
+          const newStats = effectiveStats(def, pick.t.pathIdx, pick.t.tier);
+          const want = newStats.droneCount ?? 0;
+          while (pick.t.drones.length < want) pick.t.drones.push({ angle: (pick.t.drones.length / Math.max(1, want)) * Math.PI * 2, cooldown: 0, target: null });
+          while (pick.t.drones.length > want) pick.t.drones.pop();
+        }
+      }
+    };
+
+    // ==================================================
+    // Per-lane simulation step
+    // ==================================================
+    const stepLane = (lane: Lane, dt: number, now: number) => {
+      if (!lane.alive) return;
+
+      const wave = lane.wave;
       if (wave && wave.active) {
         let allDone = true;
         for (let i = 0; i < wave.spawns.length; i++) {
@@ -734,37 +983,20 @@ export default function Game({ map, onExit }: Props) {
             if (sinceStart >= 0) {
               const wantSpawned = Math.min(s.count, Math.floor(sinceStart / s.interval) + 1);
               while (wave.spawned[i] < wantSpawned) {
-                spawnEnemy(s.kind, wave.hpMul);
+                spawnEnemy(lane, s.kind, wave.hpMul);
                 wave.spawned[i] += 1;
               }
             }
           }
         }
-        if (allDone && enemiesRef.current.length === 0) {
+        if (allDone && lane.enemies.length === 0) {
           wave.active = false;
-          waveActiveRef.current = false;
-          setWaveActive(false);
-          const bonus = 90 + levelRef.current * 14;
-          moneyRef.current += bonus;
-          setMoney(m => m + bonus);
-          floatersRef.current.push({ text: `+${bonus} bonus`, pos: { x: W / 2, y: 50 }, ttl: 1.6, color: "#dc2626" });
-          if (levelRef.current >= 30) { setGameOver("win"); gameOverRef.current = "win"; }
-          else { const next = levelRef.current + 1; levelRef.current = next; setLevel(next); }
+          lane.waveActive = false;
         }
       }
 
-      // Auto wave: trigger after a delay if waveActive becomes false
-      if (autoWaveRef.current && !waveActiveRef.current && !gameOverRef.current) {
-        autoWaveTimerRef.current += dt;
-        if (autoWaveTimerRef.current >= 4) startWave();
-      } else {
-        autoWaveTimerRef.current = 0;
-      }
-
-      const now = nowSec();
-
       const arrivedEnemies: Enemy[] = [];
-      for (const e of enemiesRef.current) {
+      for (const e of lane.enemies) {
         if (!e.alive) continue;
         const def = ENEMIES[e.kind];
 
@@ -772,7 +1004,7 @@ export default function Game({ map, onExit }: Props) {
           e.burnTimer += dt;
           if (e.burnTimer >= 0.25) {
             e.burnTimer = 0;
-            damageEnemy(e, e.burnDps * 0.25, "fire");
+            damageEnemy(lane, e, e.burnDps * 0.25, "fire");
           }
         }
         if (def.regen) e.hp = Math.min(e.maxHp, e.hp + def.regen * dt);
@@ -780,7 +1012,7 @@ export default function Game({ map, onExit }: Props) {
           e.healTimer += dt;
           if (e.healTimer >= 0.5) {
             e.healTimer = 0;
-            for (const o of enemiesRef.current) {
+            for (const o of lane.enemies) {
               if (!o.alive || o.id === e.id) continue;
               if (dist(o.pos, e.pos) <= def.healAura.range) o.hp = Math.min(o.maxHp, o.hp + def.healAura.perSec * 0.5);
             }
@@ -796,15 +1028,15 @@ export default function Game({ map, onExit }: Props) {
           e.empTimer += dt;
           if (e.empTimer >= def.empAttack.interval) {
             e.empTimer = 0;
-            const inRange = towersRef.current
+            const inRange = lane.towers
               .map(t => ({ t, d: dist(t.pos, e.pos) }))
               .filter(x => x.d <= def.empAttack!.range)
               .sort((a, b) => a.d - b.d)
               .slice(0, def.empAttack!.targets);
             for (const x of inRange) {
               x.t.stunUntil = Math.max(x.t.stunUntil, now + def.empAttack!.duration);
-              floatersRef.current.push({ text: "EMP", pos: { ...x.t.pos }, ttl: 1.0, color: "#fff37a" });
-              zapsRef.current.push({ points: [e.pos, x.t.pos], ttl: 0.3 });
+              lane.floaters.push({ text: "EMP", pos: { ...x.t.pos }, ttl: 1.0, color: "#fff37a" });
+              lane.zaps.push({ points: [e.pos, x.t.pos], ttl: 0.3 });
             }
           }
         }
@@ -821,36 +1053,37 @@ export default function Game({ map, onExit }: Props) {
           e.summonTimer += dt;
           if (e.summonTimer >= def.summon.interval) {
             e.summonTimer = 0;
-            for (let s = 0; s < def.summon.perSpawn; s++) spawnEnemy(def.summon.kind, hpMulNow() * 0.6, e.pos);
+            for (let s = 0; s < def.summon.perSpawn; s++) spawnEnemy(lane, def.summon.kind, hpMulOf(lane) * 0.6, e.pos);
           }
         }
-        for (const m of minesRef.current) {
+        for (const m of lane.mines) {
           if (m.ttl <= 0) continue;
           if (dist(e.pos, m.pos) <= ENEMIES[e.kind].radius + 6) {
             m.ttl = 0;
-            triggerExplosion(m.pos, m.splash, m.damage, "explosion", m.slowFactor, m.slowDuration);
+            triggerExplosion(lane, m.pos, m.splash, m.damage, "explosion", m.slowFactor, m.slowDuration);
           }
         }
       }
       if (arrivedEnemies.length > 0) {
         let totalDmg = 0;
         for (const e of arrivedEnemies) totalDmg += e.damage;
-        const newLives = Math.max(0, livesRef.current - totalDmg);
-        livesRef.current = newLives;
-        setLives(newLives);
-        floatersRef.current.push({ text: `-${totalDmg} HP`, pos: { x: W - 60, y: 60 }, ttl: 1.2, color: "#dc2626" });
-        if (newLives <= 0) { setGameOver("lose"); gameOverRef.current = "lose"; }
+        lane.lives = Math.max(0, lane.lives - totalDmg);
+        lane.floaters.push({ text: `-${totalDmg} HP`, pos: { x: W - 60, y: 60 }, ttl: 1.2, color: "#dc2626" });
+        if (lane.lives <= 0 && lane.alive) {
+          lane.alive = false;
+          lane.floaters.push({ text: "ELIMINATED", pos: { x: W / 2, y: H / 2 }, ttl: 2.5, color: "#ef4444" });
+        }
       }
 
-      for (const t of towersRef.current) {
+      for (const t of lane.towers) {
         const def = TOWERS[t.kind];
         const stats = effectiveStats(def, t.pathIdx, t.tier);
         const stunned = t.stunUntil > now;
-        const buffs = buffsFor(t);
+        const buffs = buffsFor(lane, t);
         const fireRate = stats.fireRate * buffs.fireRate;
         const dmgMul = buffs.damage;
 
-        if (stats.income && waveActiveRef.current) {
+        if (stats.income && lane.waveActive) {
           t.incomeTimer += dt;
           if (t.incomeTimer >= stats.income.interval) {
             t.incomeTimer = 0;
@@ -860,22 +1093,20 @@ export default function Game({ map, onExit }: Props) {
               const scale = t.tier === 1 ? 2 : t.tier === 2 ? 4 : t.tier === 3 ? 8 : 0;
               amt += lvl * scale;
             }
-            moneyRef.current += amt;
-            setMoney(m => m + amt);
-            floatersRef.current.push({ text: `+${amt}`, pos: { x: t.pos.x, y: t.pos.y - 18 }, ttl: 0.9, color: "#fff37a" });
+            grantMoney(lane, amt, { x: t.pos.x, y: t.pos.y - 18 });
             for (let i = 0; i < 5; i++) {
               const ang = -Math.PI / 2 + (Math.random() - 0.5);
               const sp = 60 + Math.random() * 40;
-              particlesRef.current.push({ pos: { ...t.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.5, maxTtl: 0.5, size: 3, color: "#fff37a", kind: "spark", blend: true });
+              lane.particles.push({ pos: { ...t.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.5, maxTtl: 0.5, size: 3, color: "#fff37a", kind: "spark", blend: true });
             }
           }
         }
 
-        if (stats.mineDamage && stats.mineCooldown !== undefined && waveActiveRef.current) {
+        if (stats.mineDamage && stats.mineCooldown !== undefined && lane.waveActive) {
           t.mineTimer += dt;
           if (t.mineTimer >= stats.mineCooldown) {
             t.mineTimer = 0;
-            layMine(t, stats, dmgMul);
+            layMine(lane, t, stats, dmgMul);
           }
         }
 
@@ -884,10 +1115,10 @@ export default function Game({ map, onExit }: Props) {
             d.angle += dt * 1.4;
             d.cooldown -= dt;
             const dronePos = { x: t.pos.x + Math.cos(d.angle) * 32, y: t.pos.y + Math.sin(d.angle) * 32 };
-            if (!d.target || !d.target.alive) d.target = pickNearest(dronePos, stats.range, new Set(), !!stats.hiddenDetect);
+            if (!d.target || !d.target.alive) d.target = pickNearest(lane, dronePos, stats.range, new Set(), !!stats.hiddenDetect);
             if (d.target && d.cooldown <= 0 && !stunned) {
               d.cooldown = 1 / fireRate;
-              fireDrone(t, d, d.target, stats, dmgMul);
+              fireDrone(lane, t, d, d.target, stats, dmgMul);
             }
           }
         }
@@ -898,11 +1129,11 @@ export default function Game({ map, onExit }: Props) {
         if (t.underbarrelCooldown > 0) t.underbarrelCooldown -= dt;
         if (t.burstQueue > 0) t.burstTimer -= dt;
 
-        const visTarget = pickTarget(t.pos, stats.range, !!stats.hiddenDetect);
+        const visTarget = pickTarget(lane, t.pos, stats.range, !!stats.hiddenDetect);
         if (visTarget) t.aimAngle = Math.atan2(visTarget.pos.y - t.pos.y, visTarget.pos.x - t.pos.x);
 
         if (t.burstQueue > 0 && t.burstTimer <= 0 && t.burstTarget && t.burstTarget.alive) {
-          fireBullet(t, t.burstTarget, stats, dmgMul);
+          fireBullet(lane, t, t.burstTarget, stats, dmgMul);
           t.burstQueue -= 1;
           t.burstTimer = stats.burstInterval ?? 0.07;
         } else if (t.burstQueue > 0 && (!t.burstTarget || !t.burstTarget.alive)) {
@@ -911,7 +1142,7 @@ export default function Game({ map, onExit }: Props) {
         }
 
         if (stats.underbarrel && t.underbarrelCooldown <= 0 && visTarget) {
-          fireGrenade(t, visTarget, stats.underbarrel, dmgMul);
+          fireGrenade(lane, t, visTarget, stats.underbarrel, dmgMul);
           t.underbarrelCooldown = stats.underbarrel.interval;
         }
 
@@ -926,26 +1157,26 @@ export default function Game({ map, onExit }: Props) {
           let last_ = visTarget;
           const chainCount = stats.chainCount ?? 3;
           for (let c = 0; c < chainCount - 1; c++) {
-            const next = pickNearest(last_.pos, 90, visited, !!stats.hiddenDetect);
+            const next = pickNearest(lane, last_.pos, 90, visited, !!stats.hiddenDetect);
             if (!next) break;
             hits.push(next); visited.add(next.id); last_ = next;
           }
           const points: Point[] = [t.pos, ...hits.map(h => h.pos)];
-          zapsRef.current.push({ points, ttl: 0.2 });
+          lane.zaps.push({ points, ttl: 0.2 });
           for (let i = 0; i < hits.length; i++) {
             const dmg = stats.damage * dmgMul * Math.pow(0.85, i);
-            damageEnemy(hits[i], dmg, stats.damageType, stats.slowFactor, stats.slowDuration);
+            damageEnemy(lane, hits[i], dmg, stats.damageType, stats.slowFactor, stats.slowDuration);
           }
         } else if (t.kind === "tesla") {
-          fireBullet(t, visTarget, stats, dmgMul);
+          fireBullet(lane, t, visTarget, stats, dmgMul);
         } else if (t.kind === "howitzer") {
-          fireHowitzer(t, visTarget, stats, dmgMul);
+          fireHowitzer(lane, t, visTarget, stats, dmgMul);
         } else if (t.kind === "mortar") {
-          fireMortar(t, visTarget, stats, dmgMul);
+          fireMortar(lane, t, visTarget, stats, dmgMul);
         } else if (t.kind === "railgun") {
-          fireRailgun(t, visTarget, stats, dmgMul);
+          fireRailgun(lane, t, visTarget, stats, dmgMul);
         } else if (t.kind === "flame") {
-          fireFlame(t, visTarget, stats, dmgMul);
+          fireFlame(lane, t, visTarget, stats, dmgMul);
         } else if (t.kind === "drone" || t.kind === "bank" || t.kind === "recon" || t.kind === "minelayer" || t.kind === "engineer") {
           // no direct attack
         } else {
@@ -953,14 +1184,14 @@ export default function Game({ map, onExit }: Props) {
             t.burstQueue = stats.burstCount - 1;
             t.burstTarget = visTarget;
             t.burstTimer = stats.burstInterval ?? 0.07;
-            fireBullet(t, visTarget, stats, dmgMul);
+            fireBullet(lane, t, visTarget, stats, dmgMul);
           } else {
-            fireBullet(t, visTarget, stats, dmgMul);
+            fireBullet(lane, t, visTarget, stats, dmgMul);
           }
         }
       }
 
-      for (const p of projectilesRef.current) {
+      for (const p of lane.projectiles) {
         if (!p.alive) continue;
         if (p.arc) {
           p.arc.t += dt;
@@ -968,7 +1199,7 @@ export default function Game({ map, onExit }: Props) {
           p.pos.x = p.arc.startX + (p.arc.targetX - p.arc.startX) * tt;
           p.pos.y = p.arc.startY + (p.arc.targetY - p.arc.startY) * tt - 4 * p.arc.arcHeight * tt * (1 - tt);
           if (tt >= 1) {
-            if (p.splashRadius) triggerExplosion({ x: p.arc.targetX, y: p.arc.targetY }, p.splashRadius, p.damage, p.damageType);
+            if (p.splashRadius) triggerExplosion(lane, { x: p.arc.targetX, y: p.arc.targetY }, p.splashRadius, p.damage, p.damageType);
             p.alive = false;
           }
           continue;
@@ -980,13 +1211,13 @@ export default function Game({ map, onExit }: Props) {
         const stepLen = p.speed * dt;
         if (d <= stepLen) {
           p.pos = { ...aim };
-          if (p.splashRadius) triggerExplosion(p.pos, p.splashRadius, p.damage, p.damageType, p.slowFactor, p.slowDuration);
+          if (p.splashRadius) triggerExplosion(lane, p.pos, p.splashRadius, p.damage, p.damageType, p.slowFactor, p.slowDuration);
           else if (p.target && p.target.alive) {
-            damageEnemy(p.target, p.damage, p.damageType, p.slowFactor, p.slowDuration, p.burnDps, p.burnDuration);
+            damageEnemy(lane, p.target, p.damage, p.damageType, p.slowFactor, p.slowDuration, p.burnDps, p.burnDuration);
             for (let i = 0; i < 4; i++) {
               const ang = Math.random() * Math.PI * 2;
               const sp = 30 + Math.random() * 60;
-              particlesRef.current.push({ pos: { ...p.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.2, maxTtl: 0.2, size: 1.5, color: p.color, kind: "spark", blend: true });
+              lane.particles.push({ pos: { ...p.pos }, vel: { x: Math.cos(ang) * sp, y: Math.sin(ang) * sp }, ttl: 0.2, maxTtl: 0.2, size: 1.5, color: p.color, kind: "spark", blend: true });
             }
           }
           p.alive = false;
@@ -996,7 +1227,7 @@ export default function Game({ map, onExit }: Props) {
         }
       }
 
-      for (const p of particlesRef.current) {
+      for (const p of lane.particles) {
         p.pos.x += p.vel.x * dt;
         p.pos.y += p.vel.y * dt;
         p.vel.x *= Math.pow(0.4, dt);
@@ -1004,16 +1235,72 @@ export default function Game({ map, onExit }: Props) {
         p.ttl -= dt;
       }
 
-      enemiesRef.current = enemiesRef.current.filter(e => e.alive);
-      projectilesRef.current = projectilesRef.current.filter(p => p.alive);
-      minesRef.current = minesRef.current.filter(m => m.ttl > 0);
-      for (const z of zapsRef.current) z.ttl -= dt;
-      zapsRef.current = zapsRef.current.filter(z => z.ttl > 0);
-      for (const b of beamsRef.current) b.ttl -= dt;
-      beamsRef.current = beamsRef.current.filter(b => b.ttl > 0);
-      for (const f of floatersRef.current) { f.ttl -= dt; f.pos.y -= 18 * dt; }
-      floatersRef.current = floatersRef.current.filter(f => f.ttl > 0);
-      particlesRef.current = particlesRef.current.filter(p => p.ttl > 0);
+      lane.enemies = lane.enemies.filter(e => e.alive);
+      lane.projectiles = lane.projectiles.filter(p => p.alive);
+      lane.mines = lane.mines.filter(m => m.ttl > 0);
+      for (const z of lane.zaps) z.ttl -= dt;
+      lane.zaps = lane.zaps.filter(z => z.ttl > 0);
+      for (const b of lane.beams) b.ttl -= dt;
+      lane.beams = lane.beams.filter(b => b.ttl > 0);
+      for (const f of lane.floaters) { f.ttl -= dt; f.pos.y -= 18 * dt; }
+      lane.floaters = lane.floaters.filter(f => f.ttl > 0);
+      lane.particles = lane.particles.filter(p => p.ttl > 0);
+
+      // AI brain
+      aiTick(lane, dt);
+    };
+
+    const step = (dt: number) => {
+      if (dt <= 0) return;
+      const now = nowSec();
+
+      for (const lane of lanesRef.current) stepLane(lane, dt, now);
+
+      // Check global wave end (when all live lanes finish)
+      const liveLanes = lanesRef.current.filter(l => l.alive);
+      if (waveActiveRef.current && liveLanes.every(l => !l.waveActive)) {
+        waveActiveRef.current = false;
+        setWaveActive(false);
+        const bonus = 90 + levelRef.current * 14;
+        for (const l of liveLanes) {
+          l.money += bonus;
+          l.floaters.push({ text: `+${bonus} bonus`, pos: { x: W / 2, y: 50 }, ttl: 1.6, color: "#dc2626" });
+        }
+        if (levelRef.current >= 30) {
+          // Solo win
+          if (mode === "solo") {
+            setGameOver("win"); gameOverRef.current = "win";
+          }
+        } else {
+          const next = levelRef.current + 1;
+          levelRef.current = next; setLevel(next);
+        }
+      }
+
+      // Check game over conditions
+      if (!gameOverRef.current) {
+        if (mode === "solo") {
+          if (!lanesRef.current[0].alive) { setGameOver("lose"); gameOverRef.current = "lose"; }
+        } else {
+          // Team-based: a team is out if all its lanes are dead
+          const playerTeam = lanesRef.current.filter(l => l.team === 0);
+          const enemyTeam = lanesRef.current.filter(l => l.team === 1);
+          const playerOut = playerTeam.every(l => !l.alive);
+          const enemyOut = enemyTeam.every(l => !l.alive);
+          if (playerOut && !enemyOut) { setGameOver("lose"); gameOverRef.current = "lose"; }
+          else if (enemyOut && !playerOut) { setGameOver("win"); gameOverRef.current = "win"; }
+          else if (enemyOut && playerOut) { setGameOver("lose"); gameOverRef.current = "lose"; }
+        }
+      }
+
+      // Auto wave: trigger after a delay if waveActive becomes false
+      if (autoWaveRef.current && !waveActiveRef.current && !gameOverRef.current) {
+        autoWaveTimerRef.current += dt;
+        if (autoWaveTimerRef.current >= 4) startWave();
+      } else {
+        autoWaveTimerRef.current = 0;
+      }
+
       if (placementErrorRef.current) {
         placementErrorRef.current.ttl -= dt;
         if (placementErrorRef.current.ttl <= 0) placementErrorRef.current = null;
@@ -1023,8 +1310,7 @@ export default function Game({ map, onExit }: Props) {
     // ===== Render helpers =====
     const drawNoBuildZones = (ctx: CanvasRenderingContext2D) => {
       for (const z of map.noBuildZones) {
-        if (z.tone === "building" || z.tone === undefined) continue; // buildings drawn as decorations; no overlay needed
-        // park / water / wall / platform / rail get a subtle hatched overlay so player can see they can't build there
+        if (z.tone === "building" || z.tone === undefined) continue;
         ctx.save();
         ctx.globalAlpha = 0;
         if (z.kind === "rect") {
@@ -1097,11 +1383,9 @@ export default function Game({ map, onExit }: Props) {
           }
           ctx.globalAlpha = 1;
         } else if (d.kind === "bridge") {
-          // shadow
           const ang = Math.atan2(d.to.y - d.from.y, d.to.x - d.from.x);
           const nx = -Math.sin(ang), ny = Math.cos(ang);
           const halfW = d.width / 2;
-          // bridge shadow under
           ctx.fillStyle = "rgba(0,0,0,0.45)";
           ctx.beginPath();
           ctx.moveTo(d.from.x + nx * (halfW + 4) + Math.cos(ang) * 2, d.from.y + ny * (halfW + 4) + Math.sin(ang) * 2);
@@ -1109,7 +1393,6 @@ export default function Game({ map, onExit }: Props) {
           ctx.lineTo(d.to.x - nx * (halfW + 4) + Math.cos(ang) * 2, d.to.y - ny * (halfW + 4) + Math.sin(ang) * 2);
           ctx.lineTo(d.from.x - nx * (halfW + 4) + Math.cos(ang) * 2, d.from.y - ny * (halfW + 4) + Math.sin(ang) * 2);
           ctx.closePath(); ctx.fill();
-          // deck
           ctx.fillStyle = d.deckColor;
           ctx.beginPath();
           ctx.moveTo(d.from.x + nx * halfW, d.from.y + ny * halfW);
@@ -1117,7 +1400,6 @@ export default function Game({ map, onExit }: Props) {
           ctx.lineTo(d.to.x - nx * halfW, d.to.y - ny * halfW);
           ctx.lineTo(d.from.x - nx * halfW, d.from.y - ny * halfW);
           ctx.closePath(); ctx.fill();
-          // rails (red lines along edges)
           ctx.strokeStyle = d.railColor; ctx.lineWidth = 1.5;
           ctx.beginPath();
           ctx.moveTo(d.from.x + nx * halfW, d.from.y + ny * halfW);
@@ -1127,7 +1409,6 @@ export default function Game({ map, onExit }: Props) {
           ctx.moveTo(d.from.x - nx * halfW, d.from.y - ny * halfW);
           ctx.lineTo(d.to.x - nx * halfW, d.to.y - ny * halfW);
           ctx.stroke();
-          // bridge supports (vertical lines)
           ctx.strokeStyle = "#0a0a0a"; ctx.lineWidth = 1;
           const supports = 4;
           for (let i = 0; i < supports; i++) {
@@ -1232,33 +1513,27 @@ export default function Game({ map, onExit }: Props) {
     };
 
     const drawTowerBase = (ctx: CanvasRenderingContext2D, t: Tower, stats: TowerStats) => {
-      // soft shadow
       const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
       grad0.addColorStop(0, "rgba(0,0,0,0.5)");
       grad0.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = grad0;
       ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
 
-      // sandbag ring (4 small bumps)
       ctx.fillStyle = "#3a3528";
       for (let i = 0; i < 8; i++) {
         const a = (i / 8) * Math.PI * 2;
         ctx.beginPath(); ctx.arc(t.pos.x + Math.cos(a) * 16, t.pos.y + Math.sin(a) * 16, 3.2, 0, Math.PI * 2); ctx.fill();
       }
-      // dark base ring
       ctx.fillStyle = "#0a0a0a";
       ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 17, 0, Math.PI * 2); ctx.fill();
-      // body radial gradient
       const bg = ctx.createRadialGradient(t.pos.x - 5, t.pos.y - 5, 1, t.pos.x, t.pos.y, 15);
       bg.addColorStop(0, lighten(stats.bodyColor, 25));
       bg.addColorStop(0.5, stats.bodyColor);
       bg.addColorStop(1, darken(stats.bodyColor, 25));
       ctx.fillStyle = bg;
       ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 15, 0, Math.PI * 2); ctx.fill();
-      // accent ring
       ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
-      // top highlight
       ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, -Math.PI * 0.85, -Math.PI * 0.25); ctx.stroke();
     };
@@ -1269,7 +1544,6 @@ export default function Game({ map, onExit }: Props) {
       ctx.globalAlpha = alpha;
 
       if (t.kind === "bank") {
-        // soft shadow
         const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
         grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
         ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
@@ -1279,7 +1553,6 @@ export default function Game({ map, onExit }: Props) {
         ctx.fillStyle = bg; ctx.fillRect(t.pos.x - 14, t.pos.y - 14, 28, 28);
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 2;
         ctx.strokeRect(t.pos.x - 14, t.pos.y - 14, 28, 28);
-        // vault wheel
         ctx.fillStyle = "#1a1a1a"; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 8, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1;
         for (let i = 0; i < 6; i++) {
@@ -1298,7 +1571,6 @@ export default function Game({ map, onExit }: Props) {
         ctx.font = "bold 10px Inter, sans-serif"; ctx.textAlign = "center";
         ctx.fillText("H", t.pos.x, t.pos.y + 4);
       } else if (t.kind === "engineer") {
-        // hex base
         const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
         grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
         ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
@@ -1321,13 +1593,11 @@ export default function Game({ map, onExit }: Props) {
         }
         ctx.closePath(); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1.5; ctx.stroke();
-        // wrench icon
         ctx.fillStyle = stats.accentColor;
         ctx.fillRect(t.pos.x - 1, t.pos.y - 6, 2, 10);
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y - 6, 3, 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = "#0a0a0a"; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y - 6, 1.5, 0, Math.PI * 2); ctx.fill();
       } else if (t.kind === "minelayer") {
-        // shadow
         const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
         grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
         ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
@@ -1341,32 +1611,27 @@ export default function Game({ map, onExit }: Props) {
         const grad0 = ctx.createRadialGradient(t.pos.x, t.pos.y + 4, 4, t.pos.x, t.pos.y + 4, 22);
         grad0.addColorStop(0, "rgba(0,0,0,0.5)"); grad0.addColorStop(1, "rgba(0,0,0,0)");
         ctx.fillStyle = grad0; ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y + 4, 22, 0, Math.PI * 2); ctx.fill();
-        // pit
         ctx.fillStyle = "#1a1a1a";
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 17, 0, Math.PI * 2); ctx.fill();
         const bg = ctx.createRadialGradient(t.pos.x - 4, t.pos.y - 4, 1, t.pos.x, t.pos.y, 12);
         bg.addColorStop(0, lighten(stats.bodyColor, 20)); bg.addColorStop(1, darken(stats.bodyColor, 25));
         ctx.fillStyle = bg;
         ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 12, 0, Math.PI * 2); ctx.fill();
-        // tube up
         ctx.fillStyle = stats.barrelColor;
         ctx.fillRect(t.pos.x - stats.barrelWidth / 2, t.pos.y - stats.barrelLength, stats.barrelWidth, stats.barrelLength + 2);
         ctx.fillStyle = stats.accentColor;
         ctx.fillRect(t.pos.x - stats.barrelWidth / 2 - 1, t.pos.y - stats.barrelLength - 1, stats.barrelWidth + 2, 2);
       } else if (t.kind === "flame") {
         drawTowerBase(ctx, t, stats);
-        // fuel tank on back
         ctx.save(); ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle + Math.PI);
         ctx.fillStyle = "#3a2a22"; ctx.fillRect(8, -5, 10, 10);
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 1; ctx.strokeRect(8, -5, 10, 10);
-        // tank stripe
         ctx.fillStyle = "#dc2626"; ctx.fillRect(8, -1, 10, 2);
         ctx.restore();
       } else {
         drawTowerBase(ctx, t, stats);
       }
 
-      // barrel for combat towers
       if (stats.barrelLength > 0 && t.kind !== "mortar" && t.kind !== "bank" && t.kind !== "drone" && t.kind !== "recon" && t.kind !== "engineer" && t.kind !== "minelayer") {
         ctx.save();
         ctx.translate(t.pos.x, t.pos.y); ctx.rotate(t.aimAngle);
@@ -1377,14 +1642,12 @@ export default function Game({ map, onExit }: Props) {
         );
         for (let b = 0; b < barrels; b++) {
           const off = barrels === 1 ? 0 : (b - (barrels - 1) / 2) * 4;
-          // barrel body with metallic gradient
           const bg = ctx.createLinearGradient(0, off - stats.barrelWidth / 2, 0, off + stats.barrelWidth / 2);
           bg.addColorStop(0, lighten(stats.barrelColor, 20));
           bg.addColorStop(0.5, stats.barrelColor);
           bg.addColorStop(1, darken(stats.barrelColor, 25));
           ctx.fillStyle = bg;
           ctx.fillRect(0, off - stats.barrelWidth / 2, stats.barrelLength, stats.barrelWidth);
-          // muzzle accent
           ctx.fillStyle = stats.accentColor;
           ctx.fillRect(stats.barrelLength - 2, off - stats.barrelWidth / 2 - 1, 3, stats.barrelWidth + 2);
         }
@@ -1420,7 +1683,6 @@ export default function Game({ map, onExit }: Props) {
       for (const d of t.drones) {
         const dx = t.pos.x + Math.cos(d.angle) * 32;
         const dy = t.pos.y + Math.sin(d.angle) * 32;
-        // drone body
         const dg = ctx.createRadialGradient(dx - 1, dy - 1, 0, dx, dy, 5);
         dg.addColorStop(0, lighten(stats.accentColor, 30));
         dg.addColorStop(1, "#0a0a0a");
@@ -1428,7 +1690,6 @@ export default function Game({ map, onExit }: Props) {
         ctx.beginPath(); ctx.arc(dx, dy, 5, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = stats.accentColor; ctx.lineWidth = 0.8;
         ctx.beginPath(); ctx.arc(dx, dy, 5, 0, Math.PI * 2); ctx.stroke();
-        // rotor blur
         ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1;
         const rotorAngle = (performance.now() / 30) % (Math.PI * 2);
         ctx.beginPath();
@@ -1442,6 +1703,23 @@ export default function Game({ map, onExit }: Props) {
       }
 
       ctx.globalAlpha = 1;
+    };
+
+    // Draw an opponent tower as a hidden / obscured marker
+    const drawHiddenTower = (ctx: CanvasRenderingContext2D, t: Tower) => {
+      ctx.save();
+      // dim base
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "rgba(220,38,38,0.55)"; ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.arc(t.pos.x, t.pos.y, 14, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#dc2626";
+      ctx.font = "bold 14px Inter, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("?", t.pos.x, t.pos.y);
+      ctx.textBaseline = "alphabetic";
+      ctx.restore();
     };
 
     const drawShape = (ctx: CanvasRenderingContext2D, x: number, y: number, r: number, shape: string) => {
@@ -1467,13 +1745,13 @@ export default function Game({ map, onExit }: Props) {
       } else { ctx.arc(x, y, r, 0, Math.PI * 2); }
     };
 
-    const drawEnemy = (ctx: CanvasRenderingContext2D, e: Enemy) => {
+    const drawEnemy = (ctx: CanvasRenderingContext2D, lane: Lane, e: Enemy) => {
       const def = ENEMIES[e.kind];
       const slowed = nowSec() < e.slowUntil;
       ctx.save();
       const visible = (() => {
         if (!def.hidden) return true;
-        for (const t of towersRef.current) {
+        for (const t of lane.towers) {
           const ts = effectiveStats(TOWERS[t.kind], t.pathIdx, t.tier);
           if (ts.hiddenDetect) {
             if ((ts.intelLevel ?? 0) >= 3) return true;
@@ -1486,7 +1764,6 @@ export default function Game({ map, onExit }: Props) {
       else if (def.hidden) ctx.globalAlpha = 0.55;
       if (e.invuln) ctx.globalAlpha = 0.35;
 
-      // shadow
       const shg = ctx.createRadialGradient(e.pos.x, e.pos.y + def.radius * 0.6, 1, e.pos.x, e.pos.y + def.radius * 0.6, def.radius + 4);
       shg.addColorStop(0, "rgba(0,0,0,0.4)"); shg.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = shg;
@@ -1495,7 +1772,6 @@ export default function Game({ map, onExit }: Props) {
       ctx.fillStyle = def.outline;
       drawShape(ctx, e.pos.x, e.pos.y, def.radius + 2, def.shape ?? "circle");
       ctx.fill();
-      // body radial gradient
       const bg = ctx.createRadialGradient(e.pos.x - def.radius * 0.4, e.pos.y - def.radius * 0.4, 1, e.pos.x, e.pos.y, def.radius);
       bg.addColorStop(0, lighten(def.color, 30));
       bg.addColorStop(0.6, def.color);
@@ -1503,7 +1779,6 @@ export default function Game({ map, onExit }: Props) {
       ctx.fillStyle = bg;
       drawShape(ctx, e.pos.x, e.pos.y, def.radius, def.shape ?? "circle");
       ctx.fill();
-      // top highlight
       ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, def.radius - 1, -Math.PI * 0.85, -Math.PI * 0.25); ctx.stroke();
 
@@ -1606,14 +1881,15 @@ export default function Game({ map, onExit }: Props) {
     };
 
     const render = (ctx: CanvasRenderingContext2D) => {
-      // DPR-aware transform: drawing in W,H logical -> scaled to canvas pixels
       ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
       ctx.imageSmoothingEnabled = true;
 
-      // bg
+      const lane = viewedLane();
+      const isOwn = lane.idx === 0;
+      const intelL = playerIntelLevel();
+
       ctx.fillStyle = map.bgColor;
       ctx.fillRect(0, 0, W, H);
-      // subtle vignette
       const vg = ctx.createRadialGradient(W / 2, H / 2, 200, W / 2, H / 2, 600);
       vg.addColorStop(0, "rgba(0,0,0,0)"); vg.addColorStop(1, "rgba(0,0,0,0.45)");
       ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
@@ -1621,7 +1897,6 @@ export default function Game({ map, onExit }: Props) {
       drawDecorations(ctx, map.decorations);
       drawNoBuildZones(ctx);
 
-      // path
       const wp = map.waypoints;
       ctx.lineCap = "round"; ctx.lineJoin = "round";
       ctx.strokeStyle = map.pathOutline; ctx.lineWidth = map.pathOutlineWidth ?? 44;
@@ -1632,17 +1907,14 @@ export default function Game({ map, onExit }: Props) {
       ctx.beginPath(); ctx.moveTo(wp[0].x, wp[0].y);
       for (let i = 1; i < wp.length; i++) ctx.lineTo(wp[i].x, wp[i].y);
       ctx.stroke();
-      // path stripe
       ctx.strokeStyle = map.pathStripeColor ?? "rgba(255,255,255,0.18)"; ctx.lineWidth = map.pathStripeWidth ?? 2;
       ctx.setLineDash(map.pathStripeDash ?? [8, 10]);
       ctx.beginPath(); ctx.moveTo(wp[0].x, wp[0].y);
       for (let i = 1; i < wp.length; i++) ctx.lineTo(wp[i].x, wp[i].y);
       ctx.stroke(); ctx.setLineDash([]);
 
-      // draw "top decorations" (overpasses / bridges) over the path
       if (map.topDecorations) drawDecorations(ctx, map.topDecorations);
 
-      // entrance / exit markers
       ctx.fillStyle = "#0a0a0a";
       ctx.beginPath(); ctx.arc(wp[0].x, wp[0].y, 14, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = "#e8e8ec";
@@ -1651,26 +1923,27 @@ export default function Game({ map, onExit }: Props) {
       ctx.beginPath(); ctx.arc(wp[wp.length - 1].x, wp[wp.length - 1].y, 14, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = "#dc2626";
       ctx.beginPath(); ctx.arc(wp[wp.length - 1].x, wp[wp.length - 1].y, 11, 0, Math.PI * 2); ctx.fill();
-      // entry arrow
       ctx.fillStyle = "#fff";
       ctx.font = "bold 8px Inter, sans-serif"; ctx.textAlign = "center";
       ctx.fillText("IN", wp[0].x, wp[0].y + 3);
       ctx.fillText("OUT", wp[wp.length - 1].x, wp[wp.length - 1].y + 3);
 
-      // mines
-      for (const m of minesRef.current) {
-        ctx.fillStyle = "#1a1a1a";
-        ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 5, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = "#dc2626";
-        ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 2, 0, Math.PI * 2); ctx.fill();
-        const pulse = (Math.sin(performance.now() / 250) + 1) / 2;
-        ctx.strokeStyle = `rgba(220,38,38,${0.3 + pulse * 0.4})`; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 7, 0, Math.PI * 2); ctx.stroke();
+      // mines (only own lane shows mines; opponents get hidden marker)
+      if (isOwn) {
+        for (const m of lane.mines) {
+          ctx.fillStyle = "#1a1a1a";
+          ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 5, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = "#dc2626";
+          ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 2, 0, Math.PI * 2); ctx.fill();
+          const pulse = (Math.sin(performance.now() / 250) + 1) / 2;
+          ctx.strokeStyle = `rgba(220,38,38,${0.3 + pulse * 0.4})`; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.arc(m.pos.x, m.pos.y, 7, 0, Math.PI * 2); ctx.stroke();
+        }
       }
 
-      // selected tower range
-      if (selectedTowerIdRef.current != null) {
-        const t = towersRef.current.find(t => t.id === selectedTowerIdRef.current);
+      // selected tower range (own only)
+      if (isOwn && selectedTowerIdRef.current != null) {
+        const t = lane.towers.find(t => t.id === selectedTowerIdRef.current);
         if (t) {
           const def = TOWERS[t.kind];
           const s = effectiveStats(def, t.pathIdx, t.tier);
@@ -1684,36 +1957,45 @@ export default function Game({ map, onExit }: Props) {
         }
       }
 
-      // ghost placement
-      const sk = selectedKindRef.current;
-      if (sk) {
-        const m = mouseRef.current;
-        if (m.x > 0 && m.x < W) {
-          const def = TOWERS[sk];
-          const onPath = isOnPath(m, map.waypoints, 24);
-          const inZone = inNoBuildZone(m, map.noBuildZones);
-          let overlap = false;
-          for (const t of towersRef.current) if (dist(t.pos, m) < 30) overlap = true;
-          const ok = !onPath && !inZone && !overlap && moneyRef.current >= def.cost;
-          if ((def.base.range ?? 0) > 0) {
-            ctx.fillStyle = ok ? "rgba(220,38,38,0.10)" : "rgba(255,80,80,0.15)";
-            ctx.strokeStyle = ok ? "rgba(220,38,38,0.6)" : "rgba(255,80,80,0.6)";
-            ctx.lineWidth = 2;
-            ctx.beginPath(); ctx.arc(m.x, m.y, def.base.range, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      // ghost placement (own only)
+      if (isOwn) {
+        const sk = selectedKindRef.current;
+        if (sk) {
+          const m = mouseRef.current;
+          if (m.x > 0 && m.x < W) {
+            const def = TOWERS[sk];
+            const onPath = isOnPath(m, map.waypoints, 24);
+            const inZone = inNoBuildZone(m, map.noBuildZones);
+            let overlap = false;
+            for (const t of lane.towers) if (dist(t.pos, m) < 30) overlap = true;
+            const ok = !onPath && !inZone && !overlap && lane.money >= def.cost;
+            if ((def.base.range ?? 0) > 0) {
+              ctx.fillStyle = ok ? "rgba(220,38,38,0.10)" : "rgba(255,80,80,0.15)";
+              ctx.strokeStyle = ok ? "rgba(220,38,38,0.6)" : "rgba(255,80,80,0.6)";
+              ctx.lineWidth = 2;
+              ctx.beginPath(); ctx.arc(m.x, m.y, def.base.range, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+            }
+            drawTower(ctx, {
+              id: -1, kind: sk, pos: m, pathIdx: null, tier: 0,
+              cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null, aimAngle: 0,
+              incomeTimer: 0, mineTimer: 0, drones: [], stunUntil: 0,
+            }, ok ? 0.7 : 0.45);
           }
-          drawTower(ctx, {
-            id: -1, kind: sk, pos: m, pathIdx: null, tier: 0,
-            cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null, aimAngle: 0,
-            incomeTimer: 0, mineTimer: 0, drones: [], stunUntil: 0,
-          }, ok ? 0.7 : 0.45);
         }
       }
 
-      for (const t of towersRef.current) drawTower(ctx, t, 1);
-      for (const e of enemiesRef.current) drawEnemy(ctx, e);
+      // Towers (intel-gated for opponents, allies fully visible)
+      const isAlly = lane.team === playerLane().team;
+      for (const t of lane.towers) {
+        if (isOwn || isAlly || towerRevealed(t.id, intelL)) {
+          drawTower(ctx, t, 1);
+        } else {
+          drawHiddenTower(ctx, t);
+        }
+      }
+      for (const e of lane.enemies) drawEnemy(ctx, lane, e);
 
-      // beams
-      for (const b of beamsRef.current) {
+      for (const b of lane.beams) {
         const a = Math.min(1, b.ttl * 6);
         ctx.save(); ctx.globalCompositeOperation = "lighter";
         ctx.strokeStyle = b.color; ctx.globalAlpha = a; ctx.lineWidth = b.width;
@@ -1722,36 +2004,32 @@ export default function Game({ map, onExit }: Props) {
         ctx.stroke(); ctx.restore();
       }
 
-      // projectiles
-      for (const p of projectilesRef.current) {
+      for (const p of lane.projectiles) {
         ctx.fillStyle = p.color;
         ctx.beginPath(); ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2); ctx.fill();
-        if (p.size >= 4) { ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 1; ctx.stroke(); }
         if (p.arc) {
-          ctx.fillStyle = "rgba(0,0,0,0.4)";
-          ctx.beginPath(); ctx.ellipse(p.arc.startX + (p.arc.targetX - p.arc.startX) * (p.arc.t / p.arc.total), p.arc.startY + (p.arc.targetY - p.arc.startY) * (p.arc.t / p.arc.total), 4, 2, 0, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = "rgba(0,0,0,0.45)";
+          ctx.beginPath(); ctx.arc(p.arc.targetX, p.arc.targetY, 3, 0, Math.PI * 2); ctx.fill();
         }
       }
 
-      // zaps
-      for (const z of zapsRef.current) {
+      for (const z of lane.zaps) {
+        const a = Math.min(1, z.ttl * 5);
         ctx.save(); ctx.globalCompositeOperation = "lighter";
-        ctx.strokeStyle = `rgba(255,243,122,${Math.min(1, z.ttl * 6)})`;
-        ctx.lineWidth = 3;
+        ctx.strokeStyle = `rgba(154,223,255,${a})`; ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(z.points[0].x, z.points[0].y);
-        for (let i = 1; i < z.points.length; i++) {
-          const a = z.points[i - 1], b = z.points[i];
-          const mx = (a.x + b.x) / 2 + (Math.random() - 0.5) * 14;
-          const my = (a.y + b.y) / 2 + (Math.random() - 0.5) * 14;
+        for (let i = 0; i < z.points.length - 1; i++) {
+          const a2 = z.points[i], b = z.points[i + 1];
+          ctx.moveTo(a2.x, a2.y);
+          const mx = (a2.x + b.x) / 2 + (Math.random() - 0.5) * 14;
+          const my = (a2.y + b.y) / 2 + (Math.random() - 0.5) * 14;
           ctx.lineTo(mx, my); ctx.lineTo(b.x, b.y);
         }
         ctx.stroke(); ctx.restore();
       }
 
-      // particles — additive groups separately
       ctx.save();
-      for (const p of particlesRef.current) {
+      for (const p of lane.particles) {
         const lifeRatio = p.ttl / p.maxTtl;
         ctx.globalAlpha = Math.max(0, lifeRatio);
         ctx.globalCompositeOperation = p.blend ? "lighter" : "source-over";
@@ -1786,18 +2064,44 @@ export default function Game({ map, onExit }: Props) {
       }
       ctx.restore();
 
-      if (placementErrorRef.current) {
+      if (isOwn && placementErrorRef.current) {
         const pe = placementErrorRef.current;
         ctx.strokeStyle = `rgba(255,80,80,${pe.ttl})`; ctx.lineWidth = 3;
         ctx.beginPath(); ctx.arc(pe.pos.x, pe.pos.y, 24 * (1.4 - pe.ttl), 0, Math.PI * 2); ctx.stroke();
       }
 
-      for (const f of floatersRef.current) {
+      for (const f of lane.floaters) {
         ctx.fillStyle = f.color;
         ctx.globalAlpha = Math.min(1, f.ttl / 1.0);
         ctx.font = "bold 13px Inter, sans-serif"; ctx.textAlign = "center";
         ctx.fillText(f.text, f.pos.x, f.pos.y);
         ctx.globalAlpha = 1;
+      }
+
+      // Spectator banner when viewing opponent
+      if (!isOwn) {
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        ctx.fillRect(0, 0, W, 32);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 14px Inter, sans-serif"; ctx.textAlign = "left";
+        ctx.fillText(`SPECTATING ${lane.name.toUpperCase()}`, 14, 21);
+        ctx.fillStyle = "#dc2626";
+        ctx.textAlign = "right";
+        ctx.font = "bold 11px Inter, sans-serif";
+        const reveal = isAlly ? "FULL VIEW (ALLY)" : intelL >= 3 ? "INTEL L3 · FULL REVEAL"
+          : intelL === 2 ? "INTEL L2 · 60% REVEAL · $ VISIBLE"
+          : intelL === 1 ? "INTEL L1 · 30% REVEAL"
+          : "NO INTEL · TOWERS HIDDEN";
+        ctx.fillText(reveal, W - 14, 21);
+        ctx.textAlign = "left";
+
+        if (!lane.alive) {
+          ctx.fillStyle = "rgba(0,0,0,0.55)";
+          ctx.fillRect(0, 0, W, H);
+          ctx.fillStyle = "#dc2626";
+          ctx.font = "bold 36px Inter, sans-serif"; ctx.textAlign = "center";
+          ctx.fillText("ELIMINATED", W / 2, H / 2);
+        }
       }
 
       if (waveAnnounce) {
@@ -1827,35 +2131,32 @@ export default function Game({ map, onExit }: Props) {
       canvas.removeEventListener("click", onClick);
       canvas.removeEventListener("mouseleave", onLeave);
     };
-  }, [map, tryPlaceTower, waveAnnounce, startWave]);
+  }, [map, mode, tryPlaceTower, waveAnnounce, startWave]);
 
-  const selectedTower = selectedTowerId != null ? towersRef.current.find(t => t.id === selectedTowerId) : null;
-  const hoveredEnemy = hoveredEnemyId != null ? enemiesRef.current.find(e => e.id === hoveredEnemyId) : null;
-
-  const intelLevel: number = (() => {
-    let best = 0;
-    for (const t of towersRef.current) {
-      const s = effectiveStats(TOWERS[t.kind], t.pathIdx, t.tier);
-      if ((s.intelLevel ?? 0) > best) best = s.intelLevel ?? 0;
-    }
-    return best;
-  })();
+  const lane = lanesRef.current[viewedLaneIdx] ?? lanesRef.current[0];
+  const isOwn = lane.idx === 0;
+  const isAlly = lane.team === 0 && !lane.isPlayer;
+  const intelL = playerIntelLevel();
+  const selectedTower = isOwn && selectedTowerId != null ? lanesRef.current[0].towers.find(t => t.id === selectedTowerId) ?? null : null;
+  const hoveredEnemy = hoveredEnemyId != null ? lane.enemies.find(e => e.id === hoveredEnemyId) ?? null : null;
 
   const restart = () => {
-    enemiesRef.current = []; towersRef.current = []; projectilesRef.current = [];
-    minesRef.current = []; beamsRef.current = [];
-    zapsRef.current = []; floatersRef.current = []; particlesRef.current = [];
-    waveRef.current = null;
-    setLives(100); livesRef.current = 100;
-    setMoney(700); moneyRef.current = 700;
+    lanesRef.current = makeLanes(mode, difficulty, playerName);
     setLevel(1); levelRef.current = 1;
     setWaveActive(false); waveActiveRef.current = false;
     setSelectedKind(null); setSelectedTowerId(null);
     setGameOver(null); gameOverRef.current = null;
+    setViewedLaneIdx(0);
   };
 
-  const playerName = (typeof window !== "undefined" && localStorage.getItem("bulwark.name")) || "Commander";
+  // What money/lives to display per lane (gated for opponents by intel)
+  const moneyOf = (l: Lane): string => {
+    if (l.team === playerLane().team) return l.money.toString();
+    if (intelL >= 2) return l.money.toString();
+    return "???";
+  };
 
+  // Spectating an opponent → swap controls panel for an Intel report
   return (
     <div className="h-screen w-screen flex flex-col bg-background">
       <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-gradient-to-b from-card to-background">
@@ -1866,12 +2167,14 @@ export default function Game({ map, onExit }: Props) {
           <div className="flex items-center gap-2 text-sm">
             <span className="text-muted-foreground tracking-wide">{map.name}</span>
             <span className="text-muted-foreground">·</span>
-            <span className="text-foreground font-mono text-xs px-1.5 py-0.5 bg-muted rounded-sm">{playerName}</span>
+            <span className="text-foreground font-mono text-xs px-1.5 py-0.5 bg-muted rounded-sm">
+              {mode === "solo" ? "SOLO" : mode === "1v1" ? "1v1" : "2v2"}
+            </span>
           </div>
         </div>
         <div className="flex items-center gap-5">
-          <Stat icon={<Heart className="w-4 h-4 text-primary" />} value={lives} label="Lives" />
-          <Stat icon={<Coins className="w-4 h-4 text-foreground" />} value={money} label="Funds" />
+          <Stat icon={<Heart className="w-4 h-4 text-primary" />} value={lanesRef.current[0].lives} label="Lives" />
+          <Stat icon={<Coins className="w-4 h-4 text-foreground" />} value={lanesRef.current[0].money} label="Funds" />
           <Stat icon={<Trophy className="w-4 h-4 text-primary" />} value={`${level} / 30`} label="Wave" />
         </div>
         <div className="flex items-center gap-2">
@@ -1896,17 +2199,61 @@ export default function Game({ map, onExit }: Props) {
         </div>
       </div>
 
+      {/* Lane tabs (multiplayer only) */}
+      {mode !== "solo" && (
+        <div className="flex items-center gap-1 px-3 py-2 border-b border-border bg-card/40 overflow-x-auto">
+          <span className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mr-2 flex items-center gap-1">
+            <Eye className="w-3 h-3" /> View Lane
+          </span>
+          {lanesRef.current.map((l) => {
+            const me = l.idx === 0;
+            const ally = l.team === 0;
+            const active = l.idx === viewedLaneIdx;
+            return (
+              <button
+                key={l.idx}
+                onClick={() => { setViewedLaneIdx(l.idx); setSelectedTowerId(null); }}
+                className={`flex items-center gap-2 px-2.5 py-1 rounded-sm text-[11px] border transition-colors ${
+                  active
+                    ? "border-primary bg-primary/10 text-primary"
+                    : ally
+                    ? "border-border hover:border-emerald-700 hover:bg-muted/40"
+                    : "border-border hover:border-red-700 hover:bg-muted/40"
+                } ${!l.alive ? "opacity-50" : ""}`}
+              >
+                <div className={`w-1.5 h-1.5 rounded-full ${ally ? "bg-emerald-500" : "bg-red-500"}`} />
+                <span className="font-bold">{l.name}</span>
+                <span className="font-mono text-muted-foreground">
+                  <Heart className="w-2.5 h-2.5 inline mr-0.5" />{l.lives}
+                </span>
+                <span className="font-mono text-muted-foreground">
+                  <Coins className="w-2.5 h-2.5 inline mr-0.5" />{moneyOf(l)}
+                </span>
+                {!l.alive && <Skull className="w-3 h-3 text-red-400" />}
+                {me && <span className="text-[9px] uppercase tracking-wider bg-primary text-primary-foreground px-1 rounded-sm">YOU</span>}
+                {ally && !me && <span className="text-[9px] uppercase tracking-wider bg-emerald-700 text-white px-1 rounded-sm">ALLY</span>}
+                {!ally && <span className="text-[9px] uppercase tracking-wider bg-red-900 text-white px-1 rounded-sm">FOE</span>}
+              </button>
+            );
+          })}
+          <div className="ml-auto flex items-center gap-2 text-[10px] text-muted-foreground">
+            <Radar className="w-3 h-3" />
+            Recon Intel: <span className={`font-mono font-bold ${intelL >= 2 ? "text-cyan-400" : intelL === 1 ? "text-amber-400" : "text-muted-foreground"}`}>L{intelL}</span>
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 flex overflow-hidden">
         <div className="flex-1 flex items-center justify-center p-3 bg-background relative">
           <div className="relative" style={{ aspectRatio: `${W} / ${H}`, width: "100%", maxWidth: "100%", maxHeight: "100%" }}>
             <canvas
               ref={canvasRef}
-              className="w-full h-full rounded-sm shadow-2xl border border-border cursor-crosshair"
+              className={`w-full h-full rounded-sm shadow-2xl border border-border ${isOwn ? "cursor-crosshair" : "cursor-not-allowed"}`}
               style={{ imageRendering: "auto" }}
             />
             {hoveredEnemy && <EnemyTooltip enemy={hoveredEnemy} />}
             <div className="absolute bottom-2 left-2 text-[10px] text-muted-foreground bg-card/80 backdrop-blur px-2 py-1 rounded-sm font-mono border border-border/50">
-              [1-9] tower · [Esc] cancel · [Space] wave · [P] pause
+              [1-9] tower · [Esc] cancel · [Space] wave · [P] pause{mode !== "solo" ? " · [V] view" : ""}
             </div>
             {gameOver && (
               <div className="absolute inset-0 flex items-center justify-center bg-black/85 rounded-sm">
@@ -1914,11 +2261,15 @@ export default function Game({ map, onExit }: Props) {
                   {gameOver === "win" ? (
                     <><Crown className="w-12 h-12 mx-auto text-primary mb-2" />
                       <h2 className="text-2xl font-bold mb-1">VICTORY</h2>
-                      <p className="text-muted-foreground mb-4">All 30 waves repelled on {map.name}.</p></>
+                      <p className="text-muted-foreground mb-4">
+                        {mode === "solo" ? `All 30 waves repelled on ${map.name}.` : "Your team outlasted the enemy commanders."}
+                      </p></>
                   ) : (
                     <><Skull className="w-12 h-12 mx-auto text-primary mb-2" />
                       <h2 className="text-2xl font-bold mb-1">DEFEATED</h2>
-                      <p className="text-muted-foreground mb-4">The line broke on wave {level}.</p></>
+                      <p className="text-muted-foreground mb-4">
+                        {mode === "solo" ? `The line broke on wave ${level}.` : "Your team was eliminated."}
+                      </p></>
                   )}
                   <div className="flex gap-2 justify-center">
                     <Button onClick={restart} className="rounded-sm">Retry</Button>
@@ -1931,73 +2282,79 @@ export default function Game({ map, onExit }: Props) {
         </div>
 
         <div className="w-80 border-l border-border bg-card flex flex-col">
-          <div className="px-3 pt-3 pb-2 border-b border-border">
-            <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center justify-between">
-              <span>Build Tower</span>
-              <span className="text-[9px] text-muted-foreground/60 normal-case tracking-wide">click to select · click map to place</span>
-            </div>
-          </div>
-          <div className="px-2 py-2 max-h-[55%] overflow-y-auto">
-            <div className="grid grid-cols-1 gap-1">
-              {TOWER_ORDER.map((k, idx) => {
-                const def = TOWERS[k];
-                const canAfford = money >= def.cost;
-                const selected = selectedKind === k;
-                const keyHint = idx < 9 ? (idx + 1).toString() : idx === 9 ? "0" : "";
-                return (
-                  <button
-                    key={k}
-                    onClick={() => { setSelectedKind(selected ? null : k); setSelectedTowerId(null); }}
-                    disabled={!canAfford}
-                    className={`text-left px-2 py-1.5 rounded-sm border transition-all ${
-                      selected ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(220,38,38,0.3)]" : "border-border/60 hover:border-primary/50 hover:bg-muted/30"
-                    } ${!canAfford ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <TowerKindIcon kind={k} />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <div className="text-xs font-bold tracking-tight">{def.name}</div>
-                          <DamageBadge type={def.base.damageType} />
-                          {keyHint && <span className="ml-auto text-[9px] font-mono bg-muted px-1 rounded-sm text-muted-foreground">{keyHint}</span>}
-                        </div>
-                        <div className="text-[10px] text-muted-foreground leading-tight truncate">{def.description}</div>
-                      </div>
-                      <div className="flex items-center text-[11px] text-foreground font-mono font-bold">
-                        <Coins className="w-3 h-3 mr-0.5 text-muted-foreground" />{def.cost}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {selectedTower ? (
-            <TowerPanel
-              tower={selectedTower}
-              money={money}
-              onUpgrade={(p) => upgradeTower(selectedTower.id, p)}
-              onSell={() => sellTower(selectedTower.id)}
-            />
-          ) : (
-            <div className="p-3 flex-1 overflow-y-auto border-t border-border">
-              <ThreatPanel level={level} intelLevel={intelLevel} />
-              <div className="mt-4 pt-3 border-t border-border text-[10px] text-muted-foreground leading-relaxed">
-                Hover any visible enemy to inspect stats. Auto-wave deploys the next wave 4s after the current ends.
-              </div>
-              <div className="mt-3 pt-3 border-t border-border">
-                <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2">Damage Types</div>
-                <div className="grid grid-cols-2 gap-1 text-[10px]">
-                  {(Object.keys(DAMAGE_LABELS) as DamageType[]).map(d => (
-                    <div key={d} className="flex items-center gap-1.5">
-                      <div className="w-2 h-2 rounded-full" style={{ background: DAMAGE_LABELS[d].color }} />
-                      <span className="text-muted-foreground">{DAMAGE_LABELS[d].label}</span>
-                    </div>
-                  ))}
+          {isOwn ? (
+            <>
+              <div className="px-3 pt-3 pb-2 border-b border-border">
+                <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center justify-between">
+                  <span>Build Tower</span>
+                  <span className="text-[9px] text-muted-foreground/60 normal-case tracking-wide">click to select · click map to place</span>
                 </div>
               </div>
-            </div>
+              <div className="px-2 py-2 max-h-[55%] overflow-y-auto">
+                <div className="grid grid-cols-1 gap-1">
+                  {TOWER_ORDER.map((k, idx) => {
+                    const def = TOWERS[k];
+                    const canAfford = lanesRef.current[0].money >= def.cost;
+                    const selected = selectedKind === k;
+                    const keyHint = idx < 9 ? (idx + 1).toString() : idx === 9 ? "0" : "";
+                    return (
+                      <button
+                        key={k}
+                        onClick={() => { setSelectedKind(selected ? null : k); setSelectedTowerId(null); }}
+                        disabled={!canAfford}
+                        className={`text-left px-2 py-1.5 rounded-sm border transition-all ${
+                          selected ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(220,38,38,0.3)]" : "border-border/60 hover:border-primary/50 hover:bg-muted/30"
+                        } ${!canAfford ? "opacity-50 cursor-not-allowed" : ""}`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <TowerKindIcon kind={k} />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <div className="text-xs font-bold tracking-tight">{def.name}</div>
+                              <DamageBadge type={def.base.damageType} />
+                              {keyHint && <span className="ml-auto text-[9px] font-mono bg-muted px-1 rounded-sm text-muted-foreground">{keyHint}</span>}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground leading-tight truncate">{def.description}</div>
+                          </div>
+                          <div className="flex items-center text-[11px] text-foreground font-mono font-bold">
+                            <Coins className="w-3 h-3 mr-0.5 text-muted-foreground" />{def.cost}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {selectedTower ? (
+                <TowerPanel
+                  tower={selectedTower}
+                  money={lanesRef.current[0].money}
+                  onUpgrade={(p) => upgradeTower(selectedTower.id, p)}
+                  onSell={() => sellTower(selectedTower.id)}
+                />
+              ) : (
+                <div className="p-3 flex-1 overflow-y-auto border-t border-border">
+                  <ThreatPanel level={level} intelLevel={intelL} />
+                  <div className="mt-4 pt-3 border-t border-border text-[10px] text-muted-foreground leading-relaxed">
+                    Hover any visible enemy to inspect stats. Auto-wave deploys the next wave 4s after the current ends.
+                  </div>
+                  <div className="mt-3 pt-3 border-t border-border">
+                    <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2">Damage Types</div>
+                    <div className="grid grid-cols-2 gap-1 text-[10px]">
+                      {(Object.keys(DAMAGE_LABELS) as DamageType[]).map(d => (
+                        <div key={d} className="flex items-center gap-1.5">
+                          <div className="w-2 h-2 rounded-full" style={{ background: DAMAGE_LABELS[d].color }} />
+                          <span className="text-muted-foreground">{DAMAGE_LABELS[d].label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <SpectatorPanel lane={lane} intelLevel={intelL} isAlly={isAlly} onReturn={() => { setViewedLaneIdx(0); setSelectedTowerId(null); }} />
           )}
         </div>
       </div>
@@ -2008,23 +2365,6 @@ export default function Game({ map, onExit }: Props) {
 // ============================================================
 // Helper components
 // ============================================================
-
-function lighten(hex: string, amt: number): string {
-  const c = parseHex(hex);
-  return rgb(Math.min(255, c.r + amt), Math.min(255, c.g + amt), Math.min(255, c.b + amt));
-}
-function darken(hex: string, amt: number): string {
-  const c = parseHex(hex);
-  return rgb(Math.max(0, c.r - amt), Math.max(0, c.g - amt), Math.max(0, c.b - amt));
-}
-function parseHex(hex: string): { r: number; g: number; b: number } {
-  const h = hex.replace("#", "");
-  const full = h.length === 3 ? h.split("").map(c => c + c).join("") : h;
-  return { r: parseInt(full.slice(0, 2), 16), g: parseInt(full.slice(2, 4), 16), b: parseInt(full.slice(4, 6), 16) };
-}
-function rgb(r: number, g: number, b: number): string {
-  return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0")).join("");
-}
 
 function TowerKindIcon({ kind }: { kind: TowerKind }) {
   const def = TOWERS[kind];
@@ -2071,7 +2411,7 @@ function EnemyTooltip({ enemy }: { enemy: Enemy }) {
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px]">
         <div><span className="text-muted-foreground">HP</span> <span className="font-mono">{Math.ceil(enemy.hp)}/{Math.ceil(enemy.maxHp)}</span></div>
         <div><span className="text-muted-foreground">SPD</span> <span className="font-mono">{def.speed}</span></div>
-        <div><span className="text-muted-foreground">DMG</span> <span className="font-mono">{def.damage}</span></div>
+        <div><span className="text-muted-foreground">DMG</span> <span className="font-mono">{enemy.damage}</span></div>
         <div><span className="text-muted-foreground">$</span> <span className="font-mono">{enemy.reward}</span></div>
       </div>
       {def.resistances && Object.keys(def.resistances).length > 0 && (
@@ -2147,6 +2487,118 @@ function ThreatPanel({ level, intelLevel }: { level: number; intelLevel: number 
         })}
       </div>
     </>
+  );
+}
+
+function SpectatorPanel({ lane, intelLevel, isAlly, onReturn }: { lane: Lane; intelLevel: number; isAlly: boolean; onReturn: () => void }) {
+  const visibleTowers = isAlly ? lane.towers : lane.towers.filter(t => towerRevealed(t.id, intelLevel));
+  const knownCount = visibleTowers.length;
+  const hiddenCount = lane.towers.length - knownCount;
+  const moneyShown = isAlly ? lane.money.toString() : intelLevel >= 2 ? lane.money.toString() : "Locked (need Intel L2)";
+
+  // Tower kind aggregates (revealed only)
+  const counts = new Map<TowerKind, number>();
+  for (const t of visibleTowers) counts.set(t.kind, (counts.get(t.kind) ?? 0) + 1);
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+      <div className="p-3 border-b border-border">
+        <div className="flex items-center gap-2 mb-1">
+          <div className={`w-2 h-2 rounded-full ${isAlly ? "bg-emerald-500" : "bg-red-500"}`} />
+          <div className="text-sm font-bold">{lane.name}</div>
+          <span className={`ml-auto text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded-sm font-bold ${isAlly ? "bg-emerald-700 text-white" : "bg-red-900 text-white"}`}>
+            {isAlly ? "ALLY" : "OPPONENT"}
+          </span>
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          {isAlly ? "Full visibility on your teammate." : "Spy on this commander. Build a Recon HQ to see more."}
+        </div>
+      </div>
+
+      <div className="p-3 border-b border-border">
+        <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center gap-2">
+          {isAlly ? <Users className="w-3 h-3" /> : <Eye className="w-3 h-3" />} Status Report
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <SpecStat label="Lives" value={lane.lives} icon={<Heart className="w-3 h-3 text-primary" />} />
+          <SpecStat label="Funds" value={moneyShown} icon={<Coins className="w-3 h-3" />} mono />
+          <SpecStat label="Towers" value={`${knownCount}${hiddenCount > 0 ? ` +${hiddenCount}?` : ""}`} icon={<Target className="w-3 h-3" />} />
+          <SpecStat label="Status" value={lane.alive ? "Active" : "Eliminated"} icon={lane.alive ? <Crosshair className="w-3 h-3" /> : <Skull className="w-3 h-3 text-primary" />} />
+        </div>
+      </div>
+
+      {!isAlly && (
+        <div className="p-3 border-b border-border">
+          <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center gap-2">
+            <Radar className="w-3 h-3" /> Recon Intel · L{intelLevel}
+          </div>
+          <div className="space-y-1.5 text-[11px]">
+            <IntelRow active={intelLevel >= 0} label="See tower placement" detail="Default: positions visible as ?" />
+            <IntelRow active={intelLevel >= 1} label="Reveal ~30% of towers" detail="Recon HQ Tier 1" />
+            <IntelRow active={intelLevel >= 2} label="Reveal ~60% + opponent funds" detail="Recon HQ Tier 2" />
+            <IntelRow active={intelLevel >= 3} label="Reveal ALL towers" detail="Recon HQ Tier 3 (Signal Intel path)" />
+          </div>
+        </div>
+      )}
+
+      <div className="p-3">
+        <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2">{isAlly ? "Tower Roster" : "Confirmed Tower Sightings"}</div>
+        {counts.size === 0 ? (
+          <div className="text-[11px] text-muted-foreground italic">
+            {isAlly ? "No towers placed yet." : intelLevel === 0 ? "Build a Recon HQ to identify enemy towers." : "No towers identified yet."}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-1">
+            {Array.from(counts.entries()).map(([k, n]) => (
+              <div key={k} className="flex items-center gap-2 text-[11px]">
+                <TowerKindIcon kind={k} />
+                <div className="flex-1">
+                  <div className="font-bold">{TOWERS[k].name}</div>
+                  <div className="text-[9px] text-muted-foreground">{TOWERS[k].description}</div>
+                </div>
+                <div className="font-mono font-bold">×{n}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {!isAlly && hiddenCount > 0 && (
+          <div className="mt-2 text-[10px] text-muted-foreground italic flex items-center gap-1">
+            <EyeOff className="w-3 h-3" /> {hiddenCount} more tower{hiddenCount === 1 ? "" : "s"} hidden — upgrade Recon HQ.
+          </div>
+        )}
+      </div>
+
+      <div className="p-3 border-t border-border">
+        <Button variant="outline" size="sm" onClick={onReturn} className="w-full rounded-sm">
+          <Home className="w-3.5 h-3.5 mr-1" /> Return to my lane
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function IntelRow({ active, label, detail }: { active: boolean; label: string; detail: string }) {
+  return (
+    <div className={`flex items-start gap-2 ${active ? "" : "opacity-40"}`}>
+      <div className={`mt-0.5 w-2 h-2 rounded-full flex-shrink-0 ${active ? "bg-primary" : "bg-muted-foreground"}`} />
+      <div className="flex-1">
+        <div className={`font-bold ${active ? "text-foreground" : "text-muted-foreground"}`}>{label}</div>
+        <div className="text-[10px] text-muted-foreground">{detail}</div>
+      </div>
+      {active ? <span className="text-[9px] uppercase tracking-wider text-primary">Active</span> : <HelpCircle className="w-3 h-3 text-muted-foreground" />}
+    </div>
+  );
+}
+
+function SpecStat({ label, value, icon, mono }: { label: string; value: string | number; icon: React.ReactNode; mono?: boolean }) {
+  return (
+    <div className="bg-muted/40 rounded-sm px-2 py-1.5 flex items-center gap-2">
+      {icon}
+      <div className="leading-tight">
+        <div className={`text-sm font-bold ${mono ? "font-mono" : ""}`}>{value}</div>
+        <div className="text-[9px] uppercase tracking-wide text-muted-foreground -mt-0.5">{label}</div>
+      </div>
+    </div>
   );
 }
 

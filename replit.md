@@ -16,6 +16,16 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - **API codegen**: Orval (from OpenAPI spec)
 - **Build**: esbuild (CJS bundle)
 
+## Artifacts
+
+- **tower-defense**: 2D tower defense game (React + Vite + Tailwind v4 + canvas).
+  - Modes: Solo (30 waves), 1v1, 2v2 (vs AI commanders, single-browser).
+  - Lane architecture: `lanesRef: Lane[]` in `Game.tsx`. Player is lane 0; AI lanes auto-play with a tower-placement + upgrade brain.
+  - Recon HQ tower's `intelLevel` (1–3) gates visibility of opponent towers (~30/60/100%) and unlocks opponent funds (L2+).
+  - 2v2 income split: 50% of every kill is shared with allied teammate.
+  - Boss damage scales with wave: minibosses ~40+, bosses ~60+, final overlord ~90+.
+  - Files: `Game.tsx` (sim+render), `screens/MainMenu.tsx`, `screens/MultiplayerLobby.tsx`, `screens/MapSelect.tsx`, `game/data.ts` (towers/enemies/waves).
+
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages

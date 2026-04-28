@@ -66,10 +66,9 @@ export default function MainMenu({ onSinglePlayer, onMultiplayer, onMapCreator }
           <Button size="lg" className="w-full h-12 text-base rounded-sm" onClick={onSinglePlayer} disabled={!name && editing}>
             <User className="w-5 h-5 mr-2" /> Singleplayer
           </Button>
-          <Button size="lg" variant="outline" className="w-full h-12 text-base rounded-sm relative" onClick={onMultiplayer} disabled>
+          <Button size="lg" variant="outline" className="w-full h-12 text-base rounded-sm relative" onClick={onMultiplayer} disabled={!name && editing}>
             <Users className="w-5 h-5 mr-2" /> Multiplayer
-            <Lock className="w-3.5 h-3.5 ml-2 opacity-60" />
-            <span className="absolute -top-2 -right-2 text-[9px] uppercase tracking-wider bg-primary text-primary-foreground px-1.5 py-0.5 rounded-sm font-bold">Soon</span>
+            <span className="absolute -top-2 -right-2 text-[9px] uppercase tracking-wider bg-primary text-primary-foreground px-1.5 py-0.5 rounded-sm font-bold">New</span>
           </Button>
           <Button size="lg" variant="outline" className="w-full h-12 text-base rounded-sm relative" onClick={onMapCreator} disabled>
             <PencilRuler className="w-5 h-5 mr-2" /> Map Creator
@@ -80,7 +79,7 @@ export default function MainMenu({ onSinglePlayer, onMultiplayer, onMapCreator }
       </div>
 
       <div className="absolute bottom-4 right-6 text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
-        v0.3 · Iron Doctrine
+        v0.4 · Iron Doctrine
       </div>
     </div>
   );

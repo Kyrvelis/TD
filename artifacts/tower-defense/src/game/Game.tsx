@@ -10,6 +10,8 @@ import {
   type MapDef, type Point, type TowerKind, type EnemyKind, type WaveSpawn, type DamageType, type TowerStats, type NoBuildZone,
 } from "./data";
 import type { MultiplayerMode, AIDifficulty } from "@/screens/MultiplayerLobby";
+import type { LobbyClient, ServerMsg, Slot as LobbySlot } from "@/lib/lobbyClient";
+import type { LaneSnap } from "./netSnapshot";
 
 const W = 800, H = 500;
 const STARTING_LIVES = 100;
@@ -98,7 +100,9 @@ type Particle = {
 
 type Lane = {
   idx: number;
+  slot: number;            // network slot id (== idx in offline)
   isPlayer: boolean;       // true for the human's lane
+  remote: boolean;         // online: lane is owned by another client; we receive snapshots for it
   team: 0 | 1;             // 0 = player team, 1 = opponent team
   name: string;
   alive: boolean;
@@ -119,10 +123,19 @@ type Lane = {
 
 export type GameMode = "solo" | MultiplayerMode;
 
+export type OnlineCtx = {
+  client: LobbyClient;
+  mySlot: number;
+  isHost: boolean;
+  lobbyMode: "1v1" | "2v2";
+  slots: LobbySlot[];
+};
+
 type Props = {
   map: MapDef;
   mode: GameMode;
   difficulty?: AIDifficulty;
+  online?: OnlineCtx;
   onExit: () => void;
 };
 
@@ -230,9 +243,9 @@ function aiThinkInterval(d: AIDifficulty): number {
   return 1.6;
 }
 
-function makeLane(idx: number, isPlayer: boolean, team: 0 | 1, name: string, ai: AIDifficulty | null, isSupport = false): Lane {
+function makeLane(idx: number, isPlayer: boolean, team: 0 | 1, name: string, ai: AIDifficulty | null, isSupport = false, slot?: number, remote = false): Lane {
   return {
-    idx, isPlayer, team, name, alive: true,
+    idx, slot: slot ?? idx, isPlayer, remote, team, name, alive: true,
     ai: ai ? {
       difficulty: ai,
       planCd: 1.5 + Math.random() * 1.0,
@@ -266,7 +279,40 @@ function makeLanes(mode: GameMode, difficulty: AIDifficulty, playerName: string)
   ];
 }
 
-export default function Game({ map, mode, difficulty = "veteran", onExit }: Props) {
+// Build lanes from an online lobby slot list. The local player's lane is placed
+// at array index 0 so existing playerLane()=lanesRef.current[0] keeps working.
+// AI slots are simulated by the host (remote=false, ai=set); for non-host
+// clients, AI slots are remote=true with ai=null so their sim runs elsewhere.
+function makeLanesOnline(slots: LobbySlot[], mySlot: number, isHost: boolean, playerName: string): Lane[] {
+  const lanes: Lane[] = [];
+  // Local player first
+  const me = slots.find((s) => s.index === mySlot);
+  if (me) {
+    lanes.push(makeLane(0, true, me.team, playerName, null, false, me.index, false));
+  }
+  for (const s of slots) {
+    if (s.index === mySlot) continue;
+    const arrIdx = lanes.length;
+    if (s.kind === "player") {
+      lanes.push(makeLane(arrIdx, false, s.team, s.playerName ?? "Commander", null, false, s.index, true));
+    } else if (s.kind === "ai") {
+      const diff = s.aiDifficulty ?? "veteran";
+      // Host runs AI sim locally; non-hosts only render snapshots from host.
+      const aiForSim = isHost ? diff : null;
+      const remote = !isHost;
+      const isSupport = s.team === me?.team; // teammate AI uses support kit
+      lanes.push(makeLane(arrIdx, false, s.team, `AI ${diff}`, aiForSim, isSupport, s.index, remote));
+    } else {
+      // empty slot — unused, but include as inactive lane skipped by sim
+      const lane = makeLane(arrIdx, false, s.team, "—", null, false, s.index, true);
+      lane.alive = false;
+      lanes.push(lane);
+    }
+  }
+  return lanes;
+}
+
+export default function Game({ map, mode, difficulty = "veteran", online, onExit }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const idCounter = useRef(1);
   const mouseRef = useRef<Point>({ x: -100, y: -100 });
@@ -274,7 +320,14 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
 
   const playerName = (typeof window !== "undefined" && localStorage.getItem("bulwark.name")) || "Commander";
 
-  const lanesRef = useRef<Lane[]>(makeLanes(mode, difficulty, playerName));
+  const onlineRef = useRef(online ?? null);
+  useEffect(() => { onlineRef.current = online ?? null; }, [online]);
+
+  const lanesRef = useRef<Lane[]>(
+    online
+      ? makeLanesOnline(online.slots, online.mySlot, online.isHost, playerName)
+      : makeLanes(mode, difficulty, playerName)
+  );
 
   const [, forceTick] = useState(0);
 
@@ -325,10 +378,12 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
     return best;
   };
 
-  const startWave = useCallback(() => {
-    if (waveActiveRef.current || gameOverRef.current) return;
-    const lvl = levelRef.current;
-    const wave = generateWave(lvl);
+  type WaveSpec = ReturnType<typeof generateWave>;
+
+  // Apply a wave specification locally — used both for local sim and to apply
+  // host-broadcast specs in online mode.
+  const applyWaveSpec = useCallback((lvl: number, wave: WaveSpec) => {
+    if (gameOverRef.current) return;
     for (const lane of lanesRef.current) {
       if (!lane.alive) continue;
       lane.wave = {
@@ -346,6 +401,21 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
     setWaveAnnounce(tag);
     setTimeout(() => setWaveAnnounce(null), 1800);
   }, []);
+
+  const startWave = useCallback(() => {
+    if (waveActiveRef.current || gameOverRef.current) return;
+    const oc = onlineRef.current;
+    // Online: only host may initiate wave starts; others wait for server.
+    if (oc && !oc.isHost) return;
+    const lvl = levelRef.current;
+    const wave = generateWave(lvl);
+    if (oc) {
+      // Server relay excludes the sender — apply locally for the host AND
+      // broadcast to others.
+      oc.client.send({ t: "waveStart", level: lvl, spec: wave });
+    }
+    applyWaveSpec(lvl, wave);
+  }, [applyWaveSpec]);
 
   const tryPlaceTower = useCallback((kind: TowerKind, p: Point, lane: Lane): boolean => {
     if (gameOverRef.current) return false;
@@ -440,6 +510,154 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [startWave]);
+
+  // ===== Online networking =====
+  useEffect(() => {
+    if (!online) return;
+    const client = online.client;
+
+    const findLaneBySlot = (slot: number) => lanesRef.current.find((l) => l.slot === slot);
+
+    const off = client.on((msg: ServerMsg) => {
+      if (msg.t === "waveStart") {
+        const lvl = (msg as { level?: number }).level ?? levelRef.current;
+        const spec = (msg as { spec?: ReturnType<typeof generateWave> }).spec;
+        if (spec) {
+          if (lvl !== levelRef.current) { levelRef.current = lvl; setLevel(lvl); }
+          applyWaveSpec(lvl, spec);
+        }
+        return;
+      }
+      if (msg.t === "levelUp") {
+        const next = (msg as { level?: number }).level;
+        if (typeof next === "number") { levelRef.current = next; setLevel(next); }
+        return;
+      }
+      if (msg.t === "kill") {
+        // 50% income share to owned, same-team, non-source lanes (2v2 only).
+        if (online.lobbyMode !== "2v2") return;
+        const fromSlot = (msg as { slot?: number }).slot;
+        const amt = (msg as { amt?: number }).amt;
+        if (typeof fromSlot !== "number" || typeof amt !== "number") return;
+        const fromLane = findLaneBySlot(fromSlot);
+        if (!fromLane) return;
+        const share = Math.round(amt * 0.5);
+        for (const ally of lanesRef.current) {
+          if (ally.remote) continue;             // we only credit lanes we own
+          if (!ally.alive) continue;
+          if (ally.slot === fromSlot) continue;
+          if (ally.team !== fromLane.team) continue;
+          ally.money += share;
+          ally.floaters.push({ text: `+${share} ally`, pos: { x: 80, y: 60 }, ttl: 1.0, color: "#fff37a" });
+        }
+        return;
+      }
+      if (msg.t === "eliminated") {
+        const slot = (msg as { slot?: number }).slot;
+        if (typeof slot !== "number") return;
+        const lane = findLaneBySlot(slot);
+        if (lane) { lane.alive = false; lane.lives = 0; }
+        return;
+      }
+      if (msg.t === "snap") {
+        const slot = (msg as { slot?: number }).slot;
+        const data = (msg as { data?: LaneSnap }).data;
+        if (typeof slot !== "number" || !data) return;
+        const lane = findLaneBySlot(slot);
+        if (!lane || !lane.remote) return;
+        // Replace lane visible state with snapshot.
+        lane.alive = data.alive;
+        lane.lives = data.lives;
+        lane.money = data.money;
+        lane.waveActive = data.waveActive;
+        lane.enemies = data.enemies.map((e) => ({
+          id: e.id, kind: e.kind, hp: e.hp, maxHp: e.maxHp,
+          pos: { x: e.x, y: e.y }, segIdx: e.segIdx, segT: e.segT,
+          speedMul: 1, slowUntil: e.slowUntil, reward: 0, damage: 0,
+          alive: true, summonTimer: 0, burnTimer: 0, burnDps: 0, burnUntil: e.burnUntil,
+          phaseTimer: 0, invuln: e.invuln, cloakedUntil: e.cloakedUntil, empTimer: 0, healTimer: 0,
+        }));
+        lane.towers = data.towers.map((t) => ({
+          id: t.id, kind: t.kind, pos: { x: t.x, y: t.y }, pathIdx: t.pathIdx, tier: t.tier,
+          cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null,
+          aimAngle: t.aimAngle, incomeTimer: 0, mineTimer: 0,
+          drones: t.drones.map((d) => ({ angle: d.angle, cooldown: 0, target: null })),
+          stunUntil: t.stunUntil,
+        }));
+        lane.projectiles = data.projectiles.map((p) => ({
+          id: p.id, pos: { x: p.x, y: p.y }, vel: { x: 0, y: 0 },
+          target: null, targetPos: { x: p.tx, y: p.ty },
+          speed: 0, damage: 0, damageType: p.damageType,
+          color: p.color, size: p.size, hiddenDetect: false, alive: true,
+        }));
+        lane.beams = data.beams.map((b) => ({
+          from: { x: b.x1, y: b.y1 }, to: { x: b.x2, y: b.y2 },
+          color: b.color, width: b.width, ttl: b.ttl,
+        }));
+        lane.zaps = data.zaps.map((z) => ({ points: z.points.map((q) => ({ x: q.x, y: q.y })), ttl: z.ttl }));
+        lane.floaters = data.floaters.map((f) => ({ text: f.text, pos: { x: f.x, y: f.y }, ttl: f.ttl, color: f.color }));
+        lane.mines = data.mines.map((m) => ({ pos: { x: m.x, y: m.y }, damage: 0, splash: m.splash, ttl: m.ttl }));
+        return;
+      }
+      if (msg.t === "ended") {
+        const winnerTeam = (msg as { winnerTeam?: 0 | 1 }).winnerTeam;
+        const myTeam = lanesRef.current[0]?.team ?? 0;
+        if (winnerTeam === myTeam) { setGameOver("win"); gameOverRef.current = "win"; }
+        else { setGameOver("lose"); gameOverRef.current = "lose"; }
+        return;
+      }
+    });
+
+    // Build a snapshot of one lane.
+    const buildSnap = (lane: Lane): LaneSnap => ({
+      slot: lane.slot,
+      alive: lane.alive,
+      lives: lane.lives,
+      money: lane.money,
+      waveActive: lane.waveActive,
+      enemies: lane.enemies.filter((e) => e.alive).map((e) => ({
+        id: e.id, kind: e.kind, hp: e.hp, maxHp: e.maxHp,
+        x: e.pos.x, y: e.pos.y, segIdx: e.segIdx, segT: e.segT,
+        slowUntil: e.slowUntil, burnUntil: e.burnUntil,
+        invuln: e.invuln, cloakedUntil: e.cloakedUntil,
+      })),
+      towers: lane.towers.map((t) => ({
+        id: t.id, kind: t.kind, x: t.pos.x, y: t.pos.y,
+        pathIdx: t.pathIdx, tier: t.tier, aimAngle: t.aimAngle, stunUntil: t.stunUntil,
+        drones: t.drones.map((d) => ({ angle: d.angle })),
+      })),
+      projectiles: lane.projectiles.filter((p) => p.alive).map((p) => ({
+        id: p.id, x: p.pos.x, y: p.pos.y, tx: p.targetPos.x, ty: p.targetPos.y,
+        damageType: p.damageType, color: p.color, size: p.size,
+      })),
+      beams: lane.beams.map((b) => ({
+        x1: b.from.x, y1: b.from.y, x2: b.to.x, y2: b.to.y,
+        color: b.color, width: b.width, ttl: b.ttl,
+      })),
+      zaps: lane.zaps.map((z) => ({ points: z.points.map((q) => ({ x: q.x, y: q.y })), ttl: z.ttl })),
+      floaters: lane.floaters.map((f) => ({ text: f.text, x: f.pos.x, y: f.pos.y, ttl: f.ttl, color: f.color })),
+      mines: lane.mines.map((m) => ({ x: m.pos.x, y: m.pos.y, splash: m.splash, ttl: m.ttl })),
+    });
+
+    let lastEliminatedFor: Set<number> = new Set();
+    const tickInterval = window.setInterval(() => {
+      // Send a snapshot for every lane WE own (local + AI for host).
+      for (const lane of lanesRef.current) {
+        if (lane.remote) continue;
+        try { client.send({ t: "snap", slot: lane.slot, data: buildSnap(lane) }); } catch { /* noop */ }
+        // Detect elimination for owned lanes.
+        if (lane.lives <= 0 && lane.alive) {
+          lane.alive = false;
+          if (!lastEliminatedFor.has(lane.slot)) {
+            lastEliminatedFor.add(lane.slot);
+            try { client.send({ t: "eliminated", slot: lane.slot }); } catch { /* noop */ }
+          }
+        }
+      }
+    }, 125);
+
+    return () => { off(); window.clearInterval(tickInterval); };
+  }, [online, applyWaveSpec]);
 
   // ===== DPR / canvas sizing =====
   useEffect(() => {
@@ -567,10 +785,31 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
     const grantMoney = (lane: Lane, amt: number, src: Point | null) => {
       lane.money += amt;
       if (src) lane.floaters.push({ text: `+${amt}`, pos: { ...src }, ttl: 0.8, color: "#dc2626" });
-      // Team income split (2v2): teammates also get 50%
+      const oc = onlineRef.current;
+      if (oc) {
+        // Online: broadcast kill events for any lane WE own (player + host's AI).
+        // The 50% income share is distributed remotely via the "kill" event,
+        // but lanes that we ALSO own locally need to be credited here too.
+        if (!lane.remote) {
+          oc.client.send({ t: "kill", slot: lane.slot, amt });
+          if (oc.lobbyMode === "2v2") {
+            const share = Math.round(amt * 0.5);
+            for (const ally of lanesRef.current) {
+              if (ally === lane) continue;
+              if (ally.remote) continue;            // remote allies get the share over the wire
+              if (ally.team !== lane.team) continue;
+              if (!ally.alive) continue;
+              ally.money += share;
+              ally.floaters.push({ text: `+${share} ally`, pos: { x: 80, y: 60 }, ttl: 1.0, color: "#fff37a" });
+            }
+          }
+        }
+        return;
+      }
+      // Offline: directly credit teammates.
       if (mode === "2v2") {
         for (const ally of lanesRef.current) {
-          if (ally.idx === lane.idx) continue;
+          if (ally === lane) continue;
           if (ally.team !== lane.team) continue;
           if (!ally.alive) continue;
           const share = Math.round(amt * 0.5);
@@ -914,6 +1153,7 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
     };
 
     const aiTick = (lane: Lane, dt: number) => {
+      if (lane.remote) return;
       if (!lane.ai || !lane.alive) return;
       const ai = lane.ai;
       ai.planCd -= dt;
@@ -970,6 +1210,18 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
     // ==================================================
     const stepLane = (lane: Lane, dt: number, now: number) => {
       if (!lane.alive) return;
+      // For remote lanes, skip authoritative simulation entirely. We just decay
+      // visual remnants from the last received snapshot.
+      if (lane.remote) {
+        for (const f of lane.floaters) { f.ttl -= dt; f.pos.y -= 18 * dt; }
+        lane.floaters = lane.floaters.filter((f) => f.ttl > 0);
+        for (const z of lane.zaps) z.ttl -= dt;
+        lane.zaps = lane.zaps.filter((z) => z.ttl > 0);
+        for (const b of lane.beams) b.ttl -= dt;
+        lane.beams = lane.beams.filter((b) => b.ttl > 0);
+        // No movement on enemies/projectiles — snapshot updates them.
+        return;
+      }
 
       const wave = lane.wave;
       if (wave && wave.active) {
@@ -1258,22 +1510,27 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
 
       // Check global wave end (when all live lanes finish)
       const liveLanes = lanesRef.current.filter(l => l.alive);
+      const oc = onlineRef.current;
       if (waveActiveRef.current && liveLanes.every(l => !l.waveActive)) {
         waveActiveRef.current = false;
         setWaveActive(false);
         const bonus = 90 + levelRef.current * 14;
+        // Only credit lanes we own — remote lanes get bonuses from their owner.
         for (const l of liveLanes) {
+          if (oc && l.remote) continue;
           l.money += bonus;
           l.floaters.push({ text: `+${bonus} bonus`, pos: { x: W / 2, y: 50 }, ttl: 1.6, color: "#dc2626" });
         }
         if (levelRef.current >= 30) {
-          // Solo win
-          if (mode === "solo") {
-            setGameOver("win"); gameOverRef.current = "win";
-          }
+          if (mode === "solo") { setGameOver("win"); gameOverRef.current = "win"; }
         } else {
-          const next = levelRef.current + 1;
-          levelRef.current = next; setLevel(next);
+          // In online, only host advances level and broadcasts.
+          if (!oc || oc.isHost) {
+            const next = levelRef.current + 1;
+            levelRef.current = next; setLevel(next);
+            if (oc) oc.client.send({ t: "levelUp", level: next });
+          }
+          // Non-host clients wait for "levelUp" message to update level.
         }
       }
 
@@ -1282,19 +1539,21 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
         if (mode === "solo") {
           if (!lanesRef.current[0].alive) { setGameOver("lose"); gameOverRef.current = "lose"; }
         } else {
-          // Team-based: a team is out if all its lanes are dead
-          const playerTeam = lanesRef.current.filter(l => l.team === 0);
-          const enemyTeam = lanesRef.current.filter(l => l.team === 1);
-          const playerOut = playerTeam.every(l => !l.alive);
-          const enemyOut = enemyTeam.every(l => !l.alive);
-          if (playerOut && !enemyOut) { setGameOver("lose"); gameOverRef.current = "lose"; }
-          else if (enemyOut && !playerOut) { setGameOver("win"); gameOverRef.current = "win"; }
-          else if (enemyOut && playerOut) { setGameOver("lose"); gameOverRef.current = "lose"; }
+          // Team-based: a team is out if all its lanes are dead.
+          const myTeam = lanesRef.current[0]?.team ?? 0;
+          const ourTeam = lanesRef.current.filter(l => l.team === myTeam);
+          const otherTeam = lanesRef.current.filter(l => l.team !== myTeam);
+          const ourOut = ourTeam.every(l => !l.alive);
+          const otherOut = otherTeam.every(l => !l.alive);
+          if (ourOut && !otherOut) { setGameOver("lose"); gameOverRef.current = "lose"; }
+          else if (otherOut && !ourOut) { setGameOver("win"); gameOverRef.current = "win"; }
+          else if (otherOut && ourOut) { setGameOver("lose"); gameOverRef.current = "lose"; }
         }
       }
 
-      // Auto wave: trigger after a delay if waveActive becomes false
-      if (autoWaveRef.current && !waveActiveRef.current && !gameOverRef.current) {
+      // Auto wave: only host (or offline) advances on autoWave.
+      const canAutoStart = !oc || oc.isHost;
+      if (autoWaveRef.current && !waveActiveRef.current && !gameOverRef.current && canAutoStart) {
         autoWaveTimerRef.current += dt;
         if (autoWaveTimerRef.current >= 4) startWave();
       } else {
@@ -2186,10 +2445,17 @@ export default function Game({ map, mode, difficulty = "veteran", onExit }: Prop
           >
             <Repeat className="w-4 h-4 mr-1" /> Auto {autoWave ? "ON" : "OFF"}
           </Button>
-          <Button variant={waveActive ? "secondary" : "default"} size="sm" onClick={startWave} disabled={waveActive || !!gameOver} className="rounded-sm">
-            <Play className="w-4 h-4 mr-1" />
-            {waveActive ? "Wave Active" : `Deploy Wave ${level}`}
-          </Button>
+          {(!online || online.isHost) ? (
+            <Button variant={waveActive ? "secondary" : "default"} size="sm" onClick={startWave} disabled={waveActive || !!gameOver} className="rounded-sm">
+              <Play className="w-4 h-4 mr-1" />
+              {waveActive ? "Wave Active" : `Deploy Wave ${level}`}
+            </Button>
+          ) : (
+            <Button variant="secondary" size="sm" disabled className="rounded-sm">
+              <Play className="w-4 h-4 mr-1" />
+              {waveActive ? "Wave Active" : `Wave ${level} — host deploys`}
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={() => setPaused(p => !p)} className="rounded-sm" title="P">
             <Pause className="w-4 h-4" />
           </Button>

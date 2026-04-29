@@ -413,7 +413,50 @@ export const DAMAGE_LABELS: Record<DamageType, { label: string; color: string }>
 export type TowerKind =
   | "rifleman" | "howitzer" | "frost" | "sniper" | "tesla"
   | "bank" | "recon" | "flame" | "mortar" | "railgun"
-  | "engineer" | "minelayer" | "drone";
+  | "engineer" | "minelayer" | "drone"
+  | "command" | "depot" | "aegis";
+
+// ===== Allied Units (sent into opposing lane or spawned by depot) =====
+export type UnitKind =
+  | "humvee" | "ifv" | "mbt"           // armor path (Command Tower)
+  | "emp_inf" | "emp_inf_t2" | "emp_inf_t3"  // EMP infantry path
+  | "ghost" | "ghost_t2" | "ghost_t3"  // stealth path
+  | "rifle_squad" | "marines"          // depot infantry path
+  | "apc" | "battle_tank";             // depot vehicle path
+
+export type UnitDef = {
+  kind: UnitKind;
+  name: string;
+  hp: number;
+  damage: number;
+  range: number;
+  fireRate: number;
+  speed: number;        // pixels/sec along path (reverse direction)
+  radius: number;
+  bodyColor: string;
+  accentColor: string;
+  shape: "circle" | "square" | "diamond" | "triangle" | "hex";
+  explodeOnDeath?: { damage: number; radius: number };
+  empOnHit?: { duration: number };  // top tier EMP infantry stuns towers it shoots
+  stealth?: boolean;                  // hidden unless tower has hiddenDetect
+  description: string;
+};
+
+export const UNITS: Record<UnitKind, UnitDef> = {
+  humvee:    { kind: "humvee", name: "Humvee", hp: 90, damage: 14, range: 110, fireRate: 1.6, speed: 60, radius: 9, bodyColor: "#4a5a3a", accentColor: "#9adfff", shape: "square", description: "Light armored vehicle." },
+  ifv:       { kind: "ifv", name: "IFV", hp: 220, damage: 28, range: 130, fireRate: 1.4, speed: 50, radius: 11, bodyColor: "#3a4828", accentColor: "#dc2626", shape: "square", description: "Infantry fighting vehicle." },
+  mbt:       { kind: "mbt", name: "Main Battle Tank", hp: 540, damage: 60, range: 150, fireRate: 1.0, speed: 38, radius: 13, bodyColor: "#2a3018", accentColor: "#ef4444", shape: "square", explodeOnDeath: { damage: 220, radius: 70 }, description: "Heavy tank. Explodes on death." },
+  emp_inf:   { kind: "emp_inf", name: "EMP Infantry", hp: 60, damage: 12, range: 100, fireRate: 1.8, speed: 95, radius: 8, bodyColor: "#3a3a4a", accentColor: "#fff37a", shape: "triangle", description: "Fast EMP-equipped infantry." },
+  emp_inf_t2:{ kind: "emp_inf_t2", name: "EMP Strike", hp: 95, damage: 18, range: 110, fireRate: 2.2, speed: 110, radius: 8, bodyColor: "#3a3a4a", accentColor: "#fff37a", shape: "triangle", description: "Faster EMP infantry." },
+  emp_inf_t3:{ kind: "emp_inf_t3", name: "EMP Commando", hp: 130, damage: 24, range: 120, fireRate: 2.6, speed: 125, radius: 9, bodyColor: "#3a3a4a", accentColor: "#fff37a", shape: "triangle", empOnHit: { duration: 1.5 }, description: "Stuns towers it shoots for 1.5s." },
+  ghost:     { kind: "ghost", name: "Ghost", hp: 70, damage: 14, range: 110, fireRate: 1.4, speed: 80, radius: 8, bodyColor: "#1a1a1a", accentColor: "#9adfff", shape: "diamond", stealth: true, description: "Stealth infiltrator." },
+  ghost_t2:  { kind: "ghost_t2", name: "Spectre", hp: 110, damage: 22, range: 120, fireRate: 1.6, speed: 90, radius: 8, bodyColor: "#1a1a1a", accentColor: "#9adfff", shape: "diamond", stealth: true, description: "Heavier stealth unit." },
+  ghost_t3:  { kind: "ghost_t3", name: "Wraith", hp: 180, damage: 36, range: 130, fireRate: 1.8, speed: 100, radius: 9, bodyColor: "#1a1a1a", accentColor: "#dc2626", shape: "diamond", stealth: true, description: "Elite stealth assassin." },
+  rifle_squad:{ kind: "rifle_squad", name: "Rifle Squad", hp: 70, damage: 10, range: 100, fireRate: 1.6, speed: 70, radius: 8, bodyColor: "#2a3a28", accentColor: "#9adfff", shape: "circle", description: "Allied rifle infantry." },
+  marines:   { kind: "marines", name: "Marines", hp: 130, damage: 18, range: 115, fireRate: 1.8, speed: 75, radius: 9, bodyColor: "#2a4828", accentColor: "#dc2626", shape: "circle", description: "Hardened allied infantry." },
+  apc:       { kind: "apc", name: "APC", hp: 200, damage: 22, range: 120, fireRate: 1.4, speed: 55, radius: 10, bodyColor: "#3a4828", accentColor: "#9adfff", shape: "square", description: "Armored personnel carrier." },
+  battle_tank:{ kind: "battle_tank", name: "Battle Tank", hp: 420, damage: 50, range: 140, fireRate: 1.0, speed: 42, radius: 12, bodyColor: "#2a3018", accentColor: "#ef4444", shape: "square", explodeOnDeath: { damage: 160, radius: 60 }, description: "Friendly tank, explodes on death." },
+};
 
 export type Appearance =
   | "beret" | "helmet" | "scope" | "antenna" | "second_barrel"
@@ -438,6 +481,9 @@ export type TowerStats = {
   income?: { perTick: number; interval: number };
   intelLevel?: number;
   buffAura?: { range: number; fireRateMul?: number; damageMul?: number };
+  antiEmpAura?: { range: number };  // aegis: prevents tower stun within range
+  commandUnits?: { kind: UnitKind; cost: number; label: string }[];  // command tower buy menu
+  depotSpawn?: { kind: UnitKind; interval: number };  // depot tower auto-spawn
   mineDamage?: number;
   mineSplash?: number;
   mineCooldown?: number;
@@ -474,7 +520,8 @@ export type TowerDef = {
   description: string;
   cost: number;
   base: TowerStats;
-  paths: [UpgradePath, UpgradePath]; // exactly two paths
+  paths: UpgradePath[]; // 2 paths usually, command tower has 3
+  multiplayerOnly?: boolean;  // true for command tower (1v1/2v2 only)
 };
 
 export const TOWERS: Record<TowerKind, TowerDef> = {
@@ -1036,11 +1083,176 @@ export const TOWERS: Record<TowerKind, TowerDef> = {
       },
     ],
   },
+
+  aegis: {
+    kind: "aegis", name: "Aegis Array",
+    description: "Anti-EMP aura. Towers nearby cannot be stunned.",
+    cost: 380,
+    base: {
+      damage: 0, range: 130, fireRate: 0, damageType: "energy",
+      antiEmpAura: { range: 130 },
+      projectileSpeed: 0, projectileColor: "#000",
+      bodyColor: "#1a2832", accentColor: "#9adfff", barrelColor: "#1a1a22",
+      barrelLength: 0, barrelWidth: 0,
+      appearance: ["satellite_dish"],
+    },
+    paths: [
+      {
+        name: "Wide Coverage", tagline: "Bigger anti-EMP umbrella.",
+        tiers: [
+          { name: "Extended Array", cost: 280, description: "+50 anti-EMP range.",
+            stats: { range: 180, antiEmpAura: { range: 180 }, appearance: ["satellite_dish", "antenna"] } },
+          { name: "Sky Shield", cost: 480, description: "+100 anti-EMP range.",
+            stats: { range: 230, antiEmpAura: { range: 230 }, accentColor: "#dc2626",
+              appearance: ["satellite_dish", "antenna"] } },
+          { name: "Total Coverage", cost: 820, description: "Massive anti-EMP umbrella.",
+            stats: { range: 320, antiEmpAura: { range: 320 }, accentColor: "#ef4444",
+              appearance: ["satellite_dish", "antenna", "energy_core"] } },
+        ],
+      },
+      {
+        name: "Hardened", tagline: "Combine anti-EMP with light combat support.",
+        tiers: [
+          { name: "Sentry Gun", cost: 320, description: "Adds light gunfire.",
+            stats: { range: 150, damage: 18, fireRate: 1.6, damageType: "physical",
+              projectileSpeed: 700, projectileColor: "#9adfff", barrelLength: 14, barrelWidth: 3,
+              antiEmpAura: { range: 150 }, appearance: ["satellite_dish"] } },
+          { name: "Combat Array", cost: 540, description: "Stronger guns and aura.",
+            stats: { range: 180, damage: 38, fireRate: 2.0, damageType: "physical",
+              projectileSpeed: 800, projectileColor: "#dc2626", barrelLength: 16, barrelWidth: 4,
+              antiEmpAura: { range: 180 }, accentColor: "#dc2626", appearance: ["satellite_dish", "scope"] } },
+          { name: "Iron Dome", cost: 940, description: "Anti-EMP + heavy fire.",
+            stats: { range: 220, damage: 80, fireRate: 2.5, damageType: "energy",
+              projectileSpeed: 900, projectileColor: "#ef4444", barrelLength: 18, barrelWidth: 5,
+              antiEmpAura: { range: 220 }, accentColor: "#ef4444", appearance: ["satellite_dish", "scope", "energy_core"] } },
+        ],
+      },
+    ],
+  },
+
+  depot: {
+    kind: "depot", name: "Vehicle Depot",
+    description: "Spawns allied units onto your lane to fight enemies.",
+    cost: 540,
+    base: {
+      damage: 0, range: 0, fireRate: 0, damageType: "physical",
+      depotSpawn: { kind: "rifle_squad", interval: 6.0 },
+      projectileSpeed: 0, projectileColor: "#000",
+      bodyColor: "#3a3a28", accentColor: "#9adfff", barrelColor: "#1a1a1a",
+      barrelLength: 0, barrelWidth: 0,
+      appearance: ["antenna"],
+    },
+    paths: [
+      {
+        name: "Infantry Barracks", tagline: "Faster, lighter allied infantry.",
+        tiers: [
+          { name: "Rifle Drills", cost: 320, description: "Spawn rifle squads more often.",
+            stats: { depotSpawn: { kind: "rifle_squad", interval: 4.5 }, appearance: ["antenna", "shield_plate"] } },
+          { name: "Marines", cost: 560, description: "Hardened marines, 4s cadence.",
+            stats: { depotSpawn: { kind: "marines", interval: 4.0 }, accentColor: "#dc2626",
+              appearance: ["antenna", "shield_plate"] } },
+          { name: "Marine Force Recon", cost: 940, description: "Marines every 3s.",
+            stats: { depotSpawn: { kind: "marines", interval: 3.0 }, accentColor: "#ef4444",
+              appearance: ["antenna", "shield_plate", "second_barrel"] } },
+        ],
+      },
+      {
+        name: "Mech Foundry", tagline: "Heavy vehicles with explode-on-death.",
+        tiers: [
+          { name: "APC Line", cost: 480, description: "Spawn APCs every 7s.",
+            stats: { depotSpawn: { kind: "apc", interval: 7.0 }, appearance: ["heavy_cap"] } },
+          { name: "Tank Line", cost: 820, description: "Battle tanks every 8s.",
+            stats: { depotSpawn: { kind: "battle_tank", interval: 8.0 }, accentColor: "#dc2626",
+              appearance: ["heavy_cap", "shield_plate"] } },
+          { name: "Armor Brigade", cost: 1400, description: "Battle tanks every 5s.",
+            stats: { depotSpawn: { kind: "battle_tank", interval: 5.0 }, accentColor: "#ef4444",
+              appearance: ["heavy_cap", "shield_plate", "muzzle_brake"] } },
+        ],
+      },
+    ],
+  },
+
+  command: {
+    kind: "command", name: "Command Center",
+    description: "Multiplayer-only. Buy units to send into the OPPOSING lane.",
+    cost: 600,
+    multiplayerOnly: true,
+    base: {
+      damage: 0, range: 0, fireRate: 0, damageType: "physical",
+      commandUnits: [
+        { kind: "humvee", cost: 80, label: "Humvee" },
+      ],
+      projectileSpeed: 0, projectileColor: "#000",
+      bodyColor: "#28323a", accentColor: "#dc2626", barrelColor: "#1a1a22",
+      barrelLength: 0, barrelWidth: 0,
+      appearance: ["antenna", "satellite_dish"],
+    },
+    paths: [
+      {
+        name: "Armor Doctrine", tagline: "Send vehicles. Top tier explodes on death.",
+        tiers: [
+          { name: "Humvee Line", cost: 280, description: "Buy Humvees.",
+            stats: { commandUnits: [{ kind: "humvee", cost: 70, label: "Humvee" }],
+              accentColor: "#dc2626", appearance: ["antenna", "satellite_dish", "shield_plate"] } },
+          { name: "IFV Line", cost: 520, description: "Buy IFVs.",
+            stats: { commandUnits: [
+              { kind: "humvee", cost: 70, label: "Humvee" },
+              { kind: "ifv", cost: 160, label: "IFV" },
+            ], accentColor: "#dc2626", appearance: ["antenna", "satellite_dish", "shield_plate"] } },
+          { name: "Armor Brigade", cost: 920, description: "Buy MBT (explodes on death).",
+            stats: { commandUnits: [
+              { kind: "humvee", cost: 70, label: "Humvee" },
+              { kind: "ifv", cost: 160, label: "IFV" },
+              { kind: "mbt", cost: 360, label: "MBT (explodes)" },
+            ], accentColor: "#ef4444", appearance: ["antenna", "satellite_dish", "shield_plate", "heavy_cap"] } },
+        ],
+      },
+      {
+        name: "EMP Doctrine", tagline: "Fast EMP infantry. Top tier stuns enemy towers.",
+        tiers: [
+          { name: "EMP Squad", cost: 240, description: "Buy EMP infantry.",
+            stats: { commandUnits: [{ kind: "emp_inf", cost: 60, label: "EMP Infantry" }],
+              accentColor: "#fff37a", appearance: ["antenna", "satellite_dish", "energy_core"] } },
+          { name: "EMP Strike Team", cost: 460, description: "Faster EMP infantry.",
+            stats: { commandUnits: [
+              { kind: "emp_inf", cost: 60, label: "EMP Infantry" },
+              { kind: "emp_inf_t2", cost: 120, label: "EMP Strike" },
+            ], accentColor: "#fff37a", appearance: ["antenna", "satellite_dish", "energy_core"] } },
+          { name: "EMP Commandos", cost: 820, description: "Top-tier stuns towers on hit.",
+            stats: { commandUnits: [
+              { kind: "emp_inf", cost: 60, label: "EMP Infantry" },
+              { kind: "emp_inf_t2", cost: 120, label: "EMP Strike" },
+              { kind: "emp_inf_t3", cost: 220, label: "EMP Commando (stun)" },
+            ], accentColor: "#ef4444", appearance: ["antenna", "satellite_dish", "energy_core", "spikes"] } },
+        ],
+      },
+      {
+        name: "Stealth Doctrine", tagline: "Hidden infiltrators. Slip past most defenses.",
+        tiers: [
+          { name: "Ghost Squad", cost: 260, description: "Buy stealth infantry.",
+            stats: { commandUnits: [{ kind: "ghost", cost: 80, label: "Ghost" }],
+              accentColor: "#9adfff", appearance: ["antenna", "satellite_dish"] } },
+          { name: "Spectre Team", cost: 480, description: "Heavier stealth.",
+            stats: { commandUnits: [
+              { kind: "ghost", cost: 80, label: "Ghost" },
+              { kind: "ghost_t2", cost: 160, label: "Spectre" },
+            ], accentColor: "#9adfff", appearance: ["antenna", "satellite_dish", "extra_optic"] } },
+          { name: "Wraith Operators", cost: 880, description: "Elite stealth assassins.",
+            stats: { commandUnits: [
+              { kind: "ghost", cost: 80, label: "Ghost" },
+              { kind: "ghost_t2", cost: 160, label: "Spectre" },
+              { kind: "ghost_t3", cost: 280, label: "Wraith" },
+            ], accentColor: "#dc2626", appearance: ["antenna", "satellite_dish", "extra_optic", "spikes"] } },
+        ],
+      },
+    ],
+  },
 };
 
 export const TOWER_ORDER: TowerKind[] = [
   "rifleman", "frost", "sniper", "tesla", "flame", "drone",
   "howitzer", "mortar", "railgun", "minelayer", "engineer", "recon", "bank",
+  "aegis", "depot", "command",
 ];
 
 export function effectiveStats(def: TowerDef, pathIdx: number | null, tier: number): TowerStats {

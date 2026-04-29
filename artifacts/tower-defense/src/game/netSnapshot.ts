@@ -2,7 +2,7 @@
 // We send only what's needed to RENDER + show summary HUD on remote clients.
 // Sim-only fields (cooldowns, burnDps, etc.) are omitted and defaulted on apply.
 
-import type { EnemyKind, TowerKind, DamageType } from "./data";
+import type { EnemyKind, TowerKind, DamageType, UnitKind } from "./data";
 
 export type EnemySnap = {
   id: number;
@@ -29,6 +29,7 @@ export type TowerSnap = {
   aimAngle: number;
   stunUntil: number;
   drones: { angle: number }[];
+  placedBySlot: number;
 };
 
 export type ProjectileSnap = {
@@ -47,12 +48,30 @@ export type ZapSnap = { points: { x: number; y: number }[]; ttl: number };
 export type FloaterSnap = { text: string; x: number; y: number; ttl: number; color: string };
 export type MineSnap = { x: number; y: number; splash: number; ttl: number };
 
+export type AlliedSnap = {
+  id: number;
+  kind: UnitKind;
+  hp: number;
+  maxHp: number;
+  x: number;
+  y: number;
+  traveled: number;
+  senderSlot: number;
+};
+
+export type QueuedUnitSnap = {
+  kind: UnitKind;
+  senderSlot: number;
+};
+
 export type LaneSnap = {
   slot: number;
   alive: boolean;
   lives: number;
   money: number;
   waveActive: boolean;
+  controllers: number[];
+  wallets: Record<number, number>;
   enemies: EnemySnap[];
   towers: TowerSnap[];
   projectiles: ProjectileSnap[];
@@ -60,4 +79,6 @@ export type LaneSnap = {
   zaps: ZapSnap[];
   floaters: FloaterSnap[];
   mines: MineSnap[];
+  alliedUnits: AlliedSnap[];
+  unitQueue: QueuedUnitSnap[];
 };

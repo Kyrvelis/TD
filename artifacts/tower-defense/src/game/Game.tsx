@@ -3,11 +3,11 @@ import { Button } from "@/components/ui/button";
 import {
   Heart, Coins, Trophy, Play, FastForward, Pause, Home, Crown, Skull, Eye, Shield, ChevronRight,
   Radar, Wrench, DollarSign, Flame, Bomb, Crosshair, Snowflake, Target, Zap, Plane, AlertTriangle,
-  Repeat, EyeOff, HelpCircle, Users,
+  Repeat, EyeOff, HelpCircle, Users, Send, Truck, ShieldPlus,
 } from "lucide-react";
 import {
-  TOWERS, TOWER_ORDER, ENEMIES, generateWave, effectiveStats, upgradeCostFor, totalSpent, DAMAGE_LABELS,
-  type MapDef, type Point, type TowerKind, type EnemyKind, type WaveSpawn, type DamageType, type TowerStats, type NoBuildZone,
+  TOWERS, TOWER_ORDER, ENEMIES, UNITS, generateWave, effectiveStats, upgradeCostFor, totalSpent, DAMAGE_LABELS,
+  type MapDef, type Point, type TowerKind, type EnemyKind, type UnitKind, type WaveSpawn, type DamageType, type TowerStats, type NoBuildZone,
 } from "./data";
 import type { MultiplayerMode, AIDifficulty } from "@/screens/MultiplayerLobby";
 import type { LobbyClient, ServerMsg, Slot as LobbySlot } from "@/lib/lobbyClient";
@@ -57,9 +57,27 @@ type Tower = {
   aimAngle: number;
   incomeTimer: number;
   mineTimer: number;
+  spawnTimer: number;
   drones: Drone[];
   stunUntil: number;
+  placedBySlot: number;
 };
+
+// Friendly unit walking the path in REVERSE (from base toward enemy spawn),
+// shooting enemies and exploding/colliding on contact.
+type AlliedUnit = {
+  id: number;
+  kind: UnitKind;
+  hp: number;
+  maxHp: number;
+  pos: Point;
+  traveled: number;        // distance walked from end-of-path back toward spawn
+  cooldown: number;
+  alive: boolean;
+  senderSlot: number;
+};
+
+type QueuedUnit = { kind: UnitKind; senderSlot: number };
 
 type Mine = { pos: Point; damage: number; splash: number; slowFactor?: number; slowDuration?: number; ttl: number };
 
@@ -98,15 +116,20 @@ type Particle = {
   blend?: boolean;
 };
 
+type LaneAI = { slot: number; difficulty: AIDifficulty; planCd: number; upgradeCd: number; preferredKinds: TowerKind[] };
+
 type Lane = {
   idx: number;
-  slot: number;            // network slot id (== idx in offline)
-  isPlayer: boolean;       // true for the human's lane
+  slot: number;            // primary slot id (lowest controller for shared lanes)
+  isPlayer: boolean;       // true if local player is a controller of this lane
   remote: boolean;         // online: lane is owned by another client; we receive snapshots for it
   team: 0 | 1;             // 0 = player team, 1 = opponent team
   name: string;
   alive: boolean;
-  ai: null | { difficulty: AIDifficulty; planCd: number; upgradeCd: number; preferredKinds: TowerKind[] };
+  ai: LaneAI | null;       // legacy: first AI controller (kept for compat)
+  ais: LaneAI[];           // all AI controllers of this lane
+  controllers: number[];   // slot ids that can issue commands for this lane
+  wallets: Record<number, number>; // per-controller money
   enemies: Enemy[];
   towers: Tower[];
   projectiles: Projectile[];
@@ -115,9 +138,11 @@ type Lane = {
   zaps: Zap[];
   floaters: Floater[];
   particles: Particle[];
+  alliedUnits: AlliedUnit[];
+  unitQueue: QueuedUnit[];   // released into THIS lane at next wave start (sent by opposing team's commanders)
   wave: { spawns: WaveSpawn[]; hpMul: number; spawned: number[]; timers: number[]; active: boolean; bossKind?: EnemyKind } | null;
   lives: number;
-  money: number;
+  money: number;             // mirror of wallets[displaySlot] for legacy reads
   waveActive: boolean;
 };
 
@@ -243,16 +268,34 @@ function aiThinkInterval(d: AIDifficulty): number {
   return 1.6;
 }
 
-function makeLane(idx: number, isPlayer: boolean, team: 0 | 1, name: string, ai: AIDifficulty | null, isSupport = false, slot?: number, remote = false): Lane {
-  return {
-    idx, slot: slot ?? idx, isPlayer, remote, team, name, alive: true,
-    ai: ai ? {
-      difficulty: ai,
+type ControllerSpec = { slot: number; ai: AIDifficulty | null; isSupport?: boolean };
+
+function makeLaneV2(opts: {
+  idx: number; team: 0 | 1; name: string;
+  controllers: ControllerSpec[];
+  isPlayer: boolean;     // true if local player is one of the controllers
+  remote: boolean;       // true if this lane is owned/simulated by another client
+}): Lane {
+  const { idx, team, name, controllers, isPlayer, remote } = opts;
+  const ais: LaneAI[] = controllers
+    .filter(c => c.ai !== null)
+    .map(c => ({
+      slot: c.slot,
+      difficulty: c.ai!,
       planCd: 1.5 + Math.random() * 1.0,
       upgradeCd: 6 + Math.random() * 3,
-      preferredKinds: isSupport ? SUPPORT_KIT : AI_KIT[ai],
-    } : null,
+      preferredKinds: c.isSupport ? SUPPORT_KIT : AI_KIT[c.ai!],
+    }));
+  const wallets: Record<number, number> = {};
+  for (const c of controllers) wallets[c.slot] = STARTING_MONEY;
+  const slot = controllers.length > 0 ? Math.min(...controllers.map(c => c.slot)) : idx;
+  return {
+    idx, slot, isPlayer, remote, team, name, alive: true,
+    ai: ais[0] ?? null, ais,
+    controllers: controllers.map(c => c.slot),
+    wallets,
     enemies: [], towers: [], projectiles: [], mines: [], beams: [], zaps: [], floaters: [], particles: [],
+    alliedUnits: [], unitQueue: [],
     wave: null,
     lives: STARTING_LIVES,
     money: STARTING_MONEY,
@@ -260,56 +303,117 @@ function makeLane(idx: number, isPlayer: boolean, team: 0 | 1, name: string, ai:
   };
 }
 
+// ===== Wallet helpers =====
+// `lane.money` is a derived display alias. After any wallet mutation, we
+// re-sync it to the local player's wallet (or first controller for spectated lanes).
+function displaySlotOf(lane: Lane, mySlot: number | null): number {
+  if (mySlot !== null && lane.controllers.includes(mySlot)) return mySlot;
+  return lane.controllers[0] ?? lane.slot;
+}
+function syncLaneMoney(lane: Lane, mySlot: number | null) {
+  const ds = displaySlotOf(lane, mySlot);
+  lane.money = lane.wallets[ds] ?? 0;
+}
+function walletOf(lane: Lane, slot: number): number {
+  return lane.wallets[slot] ?? 0;
+}
+function spendMoney(lane: Lane, slot: number, amt: number, mySlot: number | null) {
+  lane.wallets[slot] = (lane.wallets[slot] ?? 0) - amt;
+  syncLaneMoney(lane, mySlot);
+}
+function addMoneyToSlot(lane: Lane, slot: number, amt: number, mySlot: number | null) {
+  lane.wallets[slot] = (lane.wallets[slot] ?? 0) + amt;
+  syncLaneMoney(lane, mySlot);
+}
+
 function makeLanes(mode: GameMode, difficulty: AIDifficulty, playerName: string): Lane[] {
   if (mode === "solo") {
-    return [makeLane(0, true, 0, playerName, null)];
+    return [makeLaneV2({ idx: 0, team: 0, name: playerName, isPlayer: true, remote: false,
+      controllers: [{ slot: 0, ai: null }] })];
   }
   if (mode === "1v1") {
     return [
-      makeLane(0, true, 0, playerName, null),
-      makeLane(1, false, 1, "AI Adversary", difficulty),
+      makeLaneV2({ idx: 0, team: 0, name: playerName, isPlayer: true, remote: false,
+        controllers: [{ slot: 0, ai: null }] }),
+      makeLaneV2({ idx: 1, team: 1, name: "AI Adversary", isPlayer: false, remote: false,
+        controllers: [{ slot: 1, ai: difficulty }] }),
     ];
   }
-  // 2v2
+  // 2v2: ONE lane per team, two controllers each (shared lives, separate wallets).
   return [
-    makeLane(0, true, 0, playerName, null),
-    makeLane(1, false, 0, "AI Ally", "veteran", true),
-    makeLane(2, false, 1, "AI Adversary 1", difficulty),
-    makeLane(3, false, 1, "AI Adversary 2", difficulty),
+    makeLaneV2({ idx: 0, team: 0, name: `${playerName} & Ally`, isPlayer: true, remote: false,
+      controllers: [{ slot: 0, ai: null }, { slot: 1, ai: "veteran", isSupport: true }] }),
+    makeLaneV2({ idx: 1, team: 1, name: "Adversary Team", isPlayer: false, remote: false,
+      controllers: [{ slot: 2, ai: difficulty }, { slot: 3, ai: difficulty }] }),
   ];
 }
 
-// Build lanes from an online lobby slot list. The local player's lane is placed
-// at array index 0 so existing playerLane()=lanesRef.current[0] keeps working.
-// AI slots are simulated by the host (remote=false, ai=set); for non-host
-// clients, AI slots are remote=true with ai=null so their sim runs elsewhere.
-function makeLanesOnline(slots: LobbySlot[], mySlot: number, isHost: boolean, playerName: string): Lane[] {
-  const lanes: Lane[] = [];
-  // Local player first
+// Build lanes from an online lobby slot list.
+// 1v1: each player owns their own lane (legacy behavior preserved).
+// 2v2: HOST owns BOTH team lanes; non-host clients render snapshots from host.
+//      Both teammates of a lane appear as `controllers`; the local player's
+//      lane is placed at array index 0 so playerLane()=lanesRef.current[0].
+function makeLanesOnline(slots: LobbySlot[], mySlot: number, isHost: boolean, playerName: string, lobbyMode: MultiplayerMode): Lane[] {
   const me = slots.find((s) => s.index === mySlot);
-  if (me) {
-    lanes.push(makeLane(0, true, me.team, playerName, null, false, me.index, false));
-  }
-  for (const s of slots) {
-    if (s.index === mySlot) continue;
-    const arrIdx = lanes.length;
-    if (s.kind === "player") {
-      lanes.push(makeLane(arrIdx, false, s.team, s.playerName ?? "Commander", null, false, s.index, true));
-    } else if (s.kind === "ai") {
-      const diff = s.aiDifficulty ?? "veteran";
-      // Host runs AI sim locally; non-hosts only render snapshots from host.
-      const aiForSim = isHost ? diff : null;
-      const remote = !isHost;
-      const isSupport = s.team === me?.team; // teammate AI uses support kit
-      lanes.push(makeLane(arrIdx, false, s.team, `AI ${diff}`, aiForSim, isSupport, s.index, remote));
-    } else {
-      // empty slot — unused, but include as inactive lane skipped by sim
-      const lane = makeLane(arrIdx, false, s.team, "—", null, false, s.index, true);
-      lane.alive = false;
-      lanes.push(lane);
+  const myTeam: 0 | 1 = me?.team ?? 0;
+
+  if (lobbyMode === "1v1") {
+    // Legacy: 1 lane per slot.
+    const lanes: Lane[] = [];
+    if (me) {
+      lanes.push(makeLaneV2({ idx: 0, team: myTeam, name: playerName,
+        isPlayer: true, remote: false,
+        controllers: [{ slot: me.index, ai: null }] }));
     }
+    for (const s of slots) {
+      if (s.index === mySlot) continue;
+      const arrIdx = lanes.length;
+      if (s.kind === "player") {
+        lanes.push(makeLaneV2({ idx: arrIdx, team: s.team, name: s.playerName ?? "Commander",
+          isPlayer: false, remote: true,
+          controllers: [{ slot: s.index, ai: null }] }));
+      } else if (s.kind === "ai") {
+        const diff = s.aiDifficulty ?? "veteran";
+        const aiForSim = isHost ? diff : null;
+        const remote = !isHost;
+        const isSupport = s.team === myTeam;
+        lanes.push(makeLaneV2({ idx: arrIdx, team: s.team, name: `AI ${diff}`,
+          isPlayer: false, remote,
+          controllers: [{ slot: s.index, ai: aiForSim, isSupport }] }));
+      } else {
+        const lane = makeLaneV2({ idx: arrIdx, team: s.team, name: "—",
+          isPlayer: false, remote: true, controllers: [{ slot: s.index, ai: null }] });
+        lane.alive = false;
+        lanes.push(lane);
+      }
+    }
+    return lanes;
   }
-  return lanes;
+
+  // 2v2: ONE lane per team. HOST simulates both lanes.
+  const teamSlots = (t: 0 | 1) => slots.filter(s => s.team === t).sort((a, b) => a.index - b.index);
+  const buildTeamLane = (idx: number, team: 0 | 1, isPlayerTeam: boolean): Lane => {
+    const ts = teamSlots(team);
+    const ctrls: ControllerSpec[] = ts.map(s => {
+      if (s.kind === "ai") {
+        const diff = s.aiDifficulty ?? "veteran";
+        const aiForSim = isHost ? diff : null;
+        return { slot: s.index, ai: aiForSim, isSupport: false };
+      }
+      return { slot: s.index, ai: null };
+    });
+    const remote = !isHost;
+    const namePieces = ts.map(s =>
+      s.kind === "player" ? (s.index === mySlot ? playerName : (s.playerName ?? `P${s.index}`))
+      : s.kind === "ai" ? `AI ${s.aiDifficulty ?? "vet"}` : "—");
+    const name = isPlayerTeam ? `${namePieces.join(" & ")}` : `${namePieces.join(" & ")}`;
+    return makeLaneV2({ idx, team, name, isPlayer: isPlayerTeam, remote, controllers: ctrls });
+  };
+
+  return [
+    buildTeamLane(0, myTeam, true),
+    buildTeamLane(1, (myTeam === 0 ? 1 : 0) as 0 | 1, false),
+  ];
 }
 
 export default function Game({ map, mode, difficulty = "veteran", online, onExit }: Props) {
@@ -325,7 +429,7 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
 
   const lanesRef = useRef<Lane[]>(
     online
-      ? makeLanesOnline(online.slots, online.mySlot, online.isHost, playerName)
+      ? makeLanesOnline(online.slots, online.mySlot, online.isHost, playerName, online.lobbyMode)
       : makeLanes(mode, difficulty, playerName)
   );
 
@@ -368,6 +472,14 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
 
   const playerLane = () => lanesRef.current[0];
   const viewedLane = () => lanesRef.current[viewedLaneIdxRef.current] ?? lanesRef.current[0];
+  // Local player's network slot (offline = 0, online = lobby slot index).
+  const mySlot: number = online ? online.mySlot : 0;
+  // Index of the OPPOSING team's lane (where command-tower units are sent).
+  const opposingLaneIdx = (): number => {
+    const my = playerLane();
+    const opp = lanesRef.current.find(l => l.team !== my.team);
+    return opp ? opp.idx : -1;
+  };
 
   const playerIntelLevel = (): number => {
     let best = 0;
@@ -393,6 +505,23 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         active: true, bossKind: wave.bossKind,
       };
       lane.waveActive = true;
+      // Release queued allied units (sent by opposing team's commanders) into this lane.
+      // They spawn at the END of the path and travel REVERSE toward enemy spawn.
+      if (lane.unitQueue.length > 0 && (!onlineRef.current || !lane.remote)) {
+        const wpEnd = map.waypoints[map.waypoints.length - 1];
+        let stagger = 0;
+        for (const q of lane.unitQueue) {
+          const def = UNITS[q.kind];
+          lane.alliedUnits.push({
+            id: idCounter.current++, kind: q.kind, hp: def.hp, maxHp: def.hp,
+            pos: { x: wpEnd.x - stagger, y: wpEnd.y },
+            traveled: stagger, senderSlot: q.senderSlot,
+            cooldown: 0, alive: true,
+          });
+          stagger += 18;
+        }
+        lane.unitQueue = [];
+      }
     }
     setWaveActive(true);
     waveActiveRef.current = true;
@@ -400,7 +529,7 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
     const tag = wave.isBoss ? `BOSS WAVE ${lvl}` : wave.isMiniBoss ? `MINI-BOSS WAVE ${lvl}` : `WAVE ${lvl}`;
     setWaveAnnounce(tag);
     setTimeout(() => setWaveAnnounce(null), 1800);
-  }, []);
+  }, [map.waypoints]);
 
   const startWave = useCallback(() => {
     if (waveActiveRef.current || gameOverRef.current) return;
@@ -417,11 +546,12 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
     applyWaveSpec(lvl, wave);
   }, [applyWaveSpec]);
 
-  const tryPlaceTower = useCallback((kind: TowerKind, p: Point, lane: Lane): boolean => {
+  // Place a tower on `lane` charged to `slot`'s wallet.
+  const tryPlaceTower = useCallback((kind: TowerKind, p: Point, lane: Lane, slot: number): boolean => {
     if (gameOverRef.current) return false;
     if (!lane.alive) return false;
     const def = TOWERS[kind];
-    if (lane.money < def.cost) return false;
+    if (walletOf(lane, slot) < def.cost) return false;
     if (isOnPath(p, map.waypoints, 24)) return false;
     if (inNoBuildZone(p, map.noBuildZones)) return false;
     for (const t of lane.towers) if (dist(t.pos, p) < 30) return false;
@@ -432,50 +562,117 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
     lane.towers.push({
       id: idCounter.current++, kind, pos: { ...p }, pathIdx: null, tier: 0,
       cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null, aimAngle: 0,
-      incomeTimer: 0, mineTimer: 0, drones, stunUntil: 0,
+      incomeTimer: 0, mineTimer: 0, spawnTimer: 0, drones, stunUntil: 0, placedBySlot: slot,
     });
-    lane.money -= def.cost;
+    spendMoney(lane, slot, def.cost, mySlot);
     return true;
-  }, [map.waypoints, map.noBuildZones]);
+  }, [map.waypoints, map.noBuildZones, mySlot]);
 
   const tryPlaceTowerByPlayer = useCallback((kind: TowerKind, p: Point) => {
     const lane = playerLane();
-    const ok = tryPlaceTower(kind, p, lane);
+    const oc = onlineRef.current;
+    // Online + non-host 2v2: send placement request to host instead of applying locally.
+    if (oc && oc.lobbyMode === "2v2" && !oc.isHost) {
+      const def = TOWERS[kind];
+      if (walletOf(lane, mySlot) < def.cost) { placementErrorRef.current = { pos: p, ttl: 1.0 }; return; }
+      try { oc.client.send({ t: "place", slot: mySlot, kind, x: p.x, y: p.y }); } catch { /* noop */ }
+      return;
+    }
+    const ok = tryPlaceTower(kind, p, lane, mySlot);
     if (!ok) placementErrorRef.current = { pos: p, ttl: 1.0 };
     forceTick(x => x + 1);
-  }, [tryPlaceTower]);
+  }, [tryPlaceTower, mySlot]);
 
-  const upgradeTower = useCallback((id: number, pathIdx: number) => {
-    const lane = playerLane();
-    const t = lane.towers.find(t => t.id === id);
-    if (!t) return;
-    if (t.pathIdx !== null && t.pathIdx !== pathIdx) return;
+  // Apply an upgrade to a tower in `lane` charged to `slot`.
+  const tryUpgradeTowerOn = useCallback((lane: Lane, id: number, pathIdx: number, slot: number): boolean => {
+    const t = lane.towers.find(tt => tt.id === id);
+    if (!t) return false;
+    if (t.pathIdx !== null && t.pathIdx !== pathIdx) return false;
     const def = TOWERS[t.kind];
     const cost = upgradeCostFor(def, pathIdx, t.tier);
-    if (cost === null) return;
-    if (lane.money < cost) return;
-    lane.money -= cost;
+    if (cost === null) return false;
+    if (walletOf(lane, slot) < cost) return false;
+    spendMoney(lane, slot, cost, mySlot);
     if (t.pathIdx === null) t.pathIdx = pathIdx;
     t.tier += 1;
     const newStats = effectiveStats(def, t.pathIdx, t.tier);
     const want = newStats.droneCount ?? 0;
     while (t.drones.length < want) t.drones.push({ angle: (t.drones.length / Math.max(1, want)) * Math.PI * 2, cooldown: 0, target: null });
     while (t.drones.length > want) t.drones.pop();
-    forceTick(x => x + 1);
-  }, []);
+    return true;
+  }, [mySlot]);
 
-  const sellTower = useCallback((id: number) => {
+  const upgradeTower = useCallback((id: number, pathIdx: number) => {
     const lane = playerLane();
+    const oc = onlineRef.current;
+    if (oc && oc.lobbyMode === "2v2" && !oc.isHost) {
+      try { oc.client.send({ t: "upgrade", slot: mySlot, towerId: id, pathIdx }); } catch { /* noop */ }
+      return;
+    }
+    tryUpgradeTowerOn(lane, id, pathIdx, mySlot);
+    forceTick(x => x + 1);
+  }, [tryUpgradeTowerOn, mySlot]);
+
+  const sellTowerOn = useCallback((lane: Lane, id: number, slot: number): boolean => {
     const idx = lane.towers.findIndex(t => t.id === id);
-    if (idx < 0) return;
+    if (idx < 0) return false;
     const t = lane.towers[idx];
     const def = TOWERS[t.kind];
     const value = Math.round(totalSpent(def, t.pathIdx, t.tier) * 0.65);
-    lane.money += value;
+    addMoneyToSlot(lane, slot, value, mySlot);
     lane.towers.splice(idx, 1);
+    return true;
+  }, [mySlot]);
+
+  const sellTower = useCallback((id: number) => {
+    const lane = playerLane();
+    const oc = onlineRef.current;
+    if (oc && oc.lobbyMode === "2v2" && !oc.isHost) {
+      try { oc.client.send({ t: "sell", slot: mySlot, towerId: id }); } catch { /* noop */ }
+      return;
+    }
+    sellTowerOn(lane, id, mySlot);
     setSelectedTowerId(null);
     forceTick(x => x + 1);
-  }, []);
+  }, [sellTowerOn, mySlot]);
+
+  // ===== Command Tower: queue a unit purchase to be sent to OPPOSING lane next wave =====
+  const tryBuyUnitOn = useCallback((lane: Lane, towerId: number, kind: UnitKind, cost: number, slot: number): boolean => {
+    if (!lane.alive) return false;
+    const t = lane.towers.find(tt => tt.id === towerId);
+    if (!t || t.kind !== "command") return false;
+    if (walletOf(lane, slot) < cost) return false;
+    const oppIdx = (() => {
+      const opp = lanesRef.current.find(l => l.team !== lane.team);
+      return opp ? opp.idx : -1;
+    })();
+    if (oppIdx < 0) return false;
+    spendMoney(lane, slot, cost, mySlot);
+    lanesRef.current[oppIdx].unitQueue.push({ kind, senderSlot: slot });
+    lane.floaters.push({ text: `+${UNITS[kind].name} queued`, pos: { x: t.pos.x, y: t.pos.y - 22 }, ttl: 1.2, color: "#fff37a" });
+    return true;
+  }, [mySlot]);
+
+  // Refs for host-side authoritative input handlers (used by the online relay).
+  const tryPlaceTowerRef = useRef(tryPlaceTower);
+  const tryUpgradeTowerOnRef = useRef(tryUpgradeTowerOn);
+  const sellTowerOnRef = useRef(sellTowerOn);
+  const tryBuyUnitOnRef = useRef(tryBuyUnitOn);
+  useEffect(() => { tryPlaceTowerRef.current = tryPlaceTower; }, [tryPlaceTower]);
+  useEffect(() => { tryUpgradeTowerOnRef.current = tryUpgradeTowerOn; }, [tryUpgradeTowerOn]);
+  useEffect(() => { sellTowerOnRef.current = sellTowerOn; }, [sellTowerOn]);
+  useEffect(() => { tryBuyUnitOnRef.current = tryBuyUnitOn; }, [tryBuyUnitOn]);
+
+  const buyCommandUnit = useCallback((towerId: number, kind: UnitKind, cost: number) => {
+    const lane = playerLane();
+    const oc = onlineRef.current;
+    if (oc && oc.lobbyMode === "2v2" && !oc.isHost) {
+      try { oc.client.send({ t: "buyUnit", slot: mySlot, towerId, kind, cost }); } catch { /* noop */ }
+      return;
+    }
+    tryBuyUnitOn(lane, towerId, kind, cost, mySlot);
+    forceTick(x => x + 1);
+  }, [tryBuyUnitOn, mySlot]);
 
   // ===== Keybinds =====
   useEffect(() => {
@@ -533,26 +730,60 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         if (typeof next === "number") { levelRef.current = next; setLevel(next); }
         return;
       }
-      if (msg.t === "kill") {
-        // 50% income share to owned, same-team, non-source lanes (2v2 only).
-        if (online.lobbyMode !== "2v2") return;
-        const fromSlot = (msg as { slot?: number }).slot;
-        const amt = (msg as { amt?: number }).amt;
-        if (typeof fromSlot !== "number" || typeof amt !== "number") return;
-        const fromLane = findLaneBySlot(fromSlot);
-        if (!fromLane) return;
-        const share = Math.round(amt * 0.5);
-        for (const ally of lanesRef.current) {
-          if (ally.remote) continue;             // we only credit lanes we own
-          if (!ally.alive) continue;
-          if (ally.slot === fromSlot) continue;
-          if (ally.team !== fromLane.team) continue;
-          ally.money += share;
-          ally.floaters.push({ text: `+${share} ally`, pos: { x: 80, y: 60 }, ttl: 1.0, color: "#fff37a" });
+      // ===== Host-only authoritative inputs (2v2): apply teammate's place/upgrade/sell/buyUnit. =====
+      if (online.isHost && online.lobbyMode === "2v2") {
+        if (msg.t === "place") {
+          const slot = (msg as { slot?: number }).slot;
+          const kind = (msg as { kind?: TowerKind }).kind;
+          const x = (msg as { x?: number }).x;
+          const y = (msg as { y?: number }).y;
+          if (typeof slot !== "number" || !kind || typeof x !== "number" || typeof y !== "number") return;
+          const lane = lanesRef.current.find(l => l.controllers.includes(slot));
+          if (!lane) return;
+          tryPlaceTowerRef.current(kind, { x, y }, lane, slot);
+          return;
         }
-        return;
+        if (msg.t === "upgrade") {
+          const slot = (msg as { slot?: number }).slot;
+          const towerId = (msg as { towerId?: number }).towerId;
+          const pathIdx = (msg as { pathIdx?: number }).pathIdx;
+          if (typeof slot !== "number" || typeof towerId !== "number" || typeof pathIdx !== "number") return;
+          const lane = lanesRef.current.find(l => l.controllers.includes(slot));
+          if (!lane) return;
+          tryUpgradeTowerOnRef.current(lane, towerId, pathIdx, slot);
+          return;
+        }
+        if (msg.t === "sell") {
+          const slot = (msg as { slot?: number }).slot;
+          const towerId = (msg as { towerId?: number }).towerId;
+          if (typeof slot !== "number" || typeof towerId !== "number") return;
+          const lane = lanesRef.current.find(l => l.controllers.includes(slot));
+          if (!lane) return;
+          sellTowerOnRef.current(lane, towerId, slot);
+          return;
+        }
+        if (msg.t === "buyUnit") {
+          const slot = (msg as { slot?: number }).slot;
+          const towerId = (msg as { towerId?: number }).towerId;
+          const kind = (msg as { kind?: UnitKind }).kind;
+          const cost = (msg as { cost?: number }).cost;
+          if (typeof slot !== "number" || typeof towerId !== "number" || !kind || typeof cost !== "number") return;
+          const lane = lanesRef.current.find(l => l.controllers.includes(slot));
+          if (!lane) return;
+          tryBuyUnitOnRef.current(lane, towerId, kind, cost, slot);
+          return;
+        }
       }
       if (msg.t === "eliminated") {
+        const slot = (msg as { slot?: number }).slot;
+        if (typeof slot !== "number") return;
+        const lane = findLaneBySlot(slot);
+        if (lane) { lane.alive = false; lane.lives = 0; }
+        return;
+      }
+      // (Legacy "kill" handler removed: with shared 2v2 wallets the host is sole authoritative
+      // simulator and broadcasts wallet state via the snapshot.)
+      if (msg.t === "eliminatedLegacyDoNotUse__") {
         const slot = (msg as { slot?: number }).slot;
         if (typeof slot !== "number") return;
         const lane = findLaneBySlot(slot);
@@ -568,8 +799,16 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         // Replace lane visible state with snapshot.
         lane.alive = data.alive;
         lane.lives = data.lives;
-        lane.money = data.money;
+        lane.controllers = data.controllers ?? lane.controllers;
+        lane.wallets = { ...(data.wallets ?? {}) } as Record<number, number>;
+        lane.money = walletOf(lane, mySlot); // legacy alias for HUD
         lane.waveActive = data.waveActive;
+        lane.unitQueue = (data.unitQueue ?? []).map((q) => ({ kind: q.kind, senderSlot: q.senderSlot }));
+        lane.alliedUnits = (data.alliedUnits ?? []).map((a) => ({
+          id: a.id, kind: a.kind, hp: a.hp, maxHp: a.maxHp,
+          pos: { x: a.x, y: a.y }, traveled: a.traveled, senderSlot: a.senderSlot,
+          cooldown: 0, alive: true,
+        }));
         lane.enemies = data.enemies.map((e) => ({
           id: e.id, kind: e.kind, hp: e.hp, maxHp: e.maxHp,
           pos: { x: e.x, y: e.y }, segIdx: e.segIdx, segT: e.segT,
@@ -580,9 +819,9 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         lane.towers = data.towers.map((t) => ({
           id: t.id, kind: t.kind, pos: { x: t.x, y: t.y }, pathIdx: t.pathIdx, tier: t.tier,
           cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null,
-          aimAngle: t.aimAngle, incomeTimer: 0, mineTimer: 0,
+          aimAngle: t.aimAngle, incomeTimer: 0, mineTimer: 0, spawnTimer: 0,
           drones: t.drones.map((d) => ({ angle: d.angle, cooldown: 0, target: null })),
-          stunUntil: t.stunUntil,
+          stunUntil: t.stunUntil, placedBySlot: t.placedBySlot ?? lane.slot,
         }));
         lane.projectiles = data.projectiles.map((p) => ({
           id: p.id, pos: { x: p.x, y: p.y }, vel: { x: 0, y: 0 },
@@ -615,6 +854,13 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
       lives: lane.lives,
       money: lane.money,
       waveActive: lane.waveActive,
+      controllers: [...lane.controllers],
+      wallets: { ...lane.wallets },
+      unitQueue: lane.unitQueue.map((q) => ({ kind: q.kind, senderSlot: q.senderSlot })),
+      alliedUnits: lane.alliedUnits.filter((a) => a.alive).map((a) => ({
+        id: a.id, kind: a.kind, hp: a.hp, maxHp: a.maxHp,
+        x: a.pos.x, y: a.pos.y, traveled: a.traveled, senderSlot: a.senderSlot,
+      })),
       enemies: lane.enemies.filter((e) => e.alive).map((e) => ({
         id: e.id, kind: e.kind, hp: e.hp, maxHp: e.maxHp,
         x: e.pos.x, y: e.pos.y, segIdx: e.segIdx, segT: e.segT,
@@ -625,6 +871,7 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         id: t.id, kind: t.kind, x: t.pos.x, y: t.pos.y,
         pathIdx: t.pathIdx, tier: t.tier, aimAngle: t.aimAngle, stunUntil: t.stunUntil,
         drones: t.drones.map((d) => ({ angle: d.angle })),
+        placedBySlot: t.placedBySlot,
       })),
       projectiles: lane.projectiles.filter((p) => p.alive).map((p) => ({
         id: p.id, x: p.pos.x, y: p.pos.y, tx: p.targetPos.x, ty: p.targetPos.y,
@@ -772,6 +1019,17 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
       });
     };
 
+    // Anti-EMP aegis: any aegis tower within its aura range protects targets at `pos`.
+    const isAegisProtected = (lane: Lane, pos: Point): boolean => {
+      for (const t of lane.towers) {
+        if (t.kind !== "aegis") continue;
+        const stats = effectiveStats(TOWERS.aegis, t.pathIdx, t.tier);
+        const r = stats.antiEmpAura?.range ?? 0;
+        if (r > 0 && dist(t.pos, pos) <= r) return true;
+      }
+      return false;
+    };
+
     const aegisMul = (lane: Lane, target: Enemy): number => {
       let mul = 1;
       for (const e of lane.enemies) {
@@ -782,41 +1040,12 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
       return mul;
     };
 
+    // Split kill rewards evenly across the lane's controllers (50/50 in 2v2).
     const grantMoney = (lane: Lane, amt: number, src: Point | null) => {
-      lane.money += amt;
+      const ctrls = lane.controllers.length > 0 ? lane.controllers : [lane.slot];
+      const share = ctrls.length > 1 ? Math.round(amt / ctrls.length) : amt;
+      for (const s of ctrls) addMoneyToSlot(lane, s, share, mySlot);
       if (src) lane.floaters.push({ text: `+${amt}`, pos: { ...src }, ttl: 0.8, color: "#dc2626" });
-      const oc = onlineRef.current;
-      if (oc) {
-        // Online: broadcast kill events for any lane WE own (player + host's AI).
-        // The 50% income share is distributed remotely via the "kill" event,
-        // but lanes that we ALSO own locally need to be credited here too.
-        if (!lane.remote) {
-          oc.client.send({ t: "kill", slot: lane.slot, amt });
-          if (oc.lobbyMode === "2v2") {
-            const share = Math.round(amt * 0.5);
-            for (const ally of lanesRef.current) {
-              if (ally === lane) continue;
-              if (ally.remote) continue;            // remote allies get the share over the wire
-              if (ally.team !== lane.team) continue;
-              if (!ally.alive) continue;
-              ally.money += share;
-              ally.floaters.push({ text: `+${share} ally`, pos: { x: 80, y: 60 }, ttl: 1.0, color: "#fff37a" });
-            }
-          }
-        }
-        return;
-      }
-      // Offline: directly credit teammates.
-      if (mode === "2v2") {
-        for (const ally of lanesRef.current) {
-          if (ally === lane) continue;
-          if (ally.team !== lane.team) continue;
-          if (!ally.alive) continue;
-          const share = Math.round(amt * 0.5);
-          ally.money += share;
-          ally.floaters.push({ text: `+${share} ally`, pos: { x: 80, y: 60 }, ttl: 1.0, color: "#fff37a" });
-        }
-      }
     };
 
     const damageEnemy = (lane: Lane, e: Enemy, dmg: number, type: DamageType, slowFactor?: number, slowDuration?: number, burnDps?: number, burnDuration?: number) => {
@@ -1154,53 +1383,53 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
 
     const aiTick = (lane: Lane, dt: number) => {
       if (lane.remote) return;
-      if (!lane.ai || !lane.alive) return;
-      const ai = lane.ai;
-      ai.planCd -= dt;
-      ai.upgradeCd -= dt;
+      if (!lane.alive) return;
+      // Each AI controller spends from its OWN wallet (no shared 2v2 pool).
+      for (const ai of lane.ais) {
+        ai.planCd -= dt;
+        ai.upgradeCd -= dt;
+        const wallet = walletOf(lane, ai.slot);
 
-      // Try to place a tower
-      if (ai.planCd <= 0) {
-        ai.planCd = aiThinkInterval(ai.difficulty) * (0.7 + Math.random() * 0.6);
-        // Affordability-aware pick
-        const affordable = ai.preferredKinds.filter(k => lane.money >= TOWERS[k].cost);
-        if (affordable.length > 0) {
-          // Prefer cheap if poor, expensive if rich
-          let kind: TowerKind;
-          if (lane.money >= 1500 && Math.random() < 0.4) {
-            const expensive = affordable.filter(k => TOWERS[k].cost >= 400);
-            kind = (expensive.length > 0 ? expensive : affordable)[Math.floor(Math.random() * (expensive.length > 0 ? expensive.length : affordable.length))];
-          } else {
-            kind = affordable[Math.floor(Math.random() * affordable.length)];
+        // Try to place a tower
+        if (ai.planCd <= 0) {
+          ai.planCd = aiThinkInterval(ai.difficulty) * (0.7 + Math.random() * 0.6);
+          // Skip multiplayer-only kinds when not in a multiplayer game.
+          const isMP = !!onlineRef.current;
+          const affordable = ai.preferredKinds.filter(k => {
+            if (TOWERS[k].multiplayerOnly && !isMP) return false;
+            return wallet >= TOWERS[k].cost;
+          });
+          if (affordable.length > 0) {
+            let kind: TowerKind;
+            if (wallet >= 1500 && Math.random() < 0.4) {
+              const expensive = affordable.filter(k => TOWERS[k].cost >= 400);
+              kind = (expensive.length > 0 ? expensive : affordable)[Math.floor(Math.random() * (expensive.length > 0 ? expensive.length : affordable.length))];
+            } else {
+              kind = affordable[Math.floor(Math.random() * affordable.length)];
+            }
+            const spot = aiPickPlacement(lane, kind);
+            if (spot) tryPlaceTower(kind, spot, lane, ai.slot);
           }
-          const spot = aiPickPlacement(lane, kind);
-          if (spot) tryPlaceTower(kind, spot, lane);
         }
-      }
-      // Try to upgrade
-      if (ai.upgradeCd <= 0 && lane.towers.length > 0) {
-        ai.upgradeCd = aiThinkInterval(ai.difficulty) * 1.8 * (0.8 + Math.random() * 0.5);
-        // Pick a random tower we can upgrade
-        const candidates = lane.towers
-          .map(t => {
-            const def = TOWERS[t.kind];
-            if (t.tier >= 3) return null;
-            const pathIdx = t.pathIdx ?? (Math.random() < 0.5 ? 0 : 1);
-            const cost = upgradeCostFor(def, pathIdx, t.tier);
-            if (cost === null || lane.money < cost) return null;
-            return { t, pathIdx, cost };
-          })
-          .filter((x): x is { t: Tower; pathIdx: number; cost: number } => x !== null);
-        if (candidates.length > 0) {
-          const pick = candidates[Math.floor(Math.random() * candidates.length)];
-          lane.money -= pick.cost;
-          if (pick.t.pathIdx === null) pick.t.pathIdx = pick.pathIdx;
-          pick.t.tier += 1;
-          const def = TOWERS[pick.t.kind];
-          const newStats = effectiveStats(def, pick.t.pathIdx, pick.t.tier);
-          const want = newStats.droneCount ?? 0;
-          while (pick.t.drones.length < want) pick.t.drones.push({ angle: (pick.t.drones.length / Math.max(1, want)) * Math.PI * 2, cooldown: 0, target: null });
-          while (pick.t.drones.length > want) pick.t.drones.pop();
+        // Try to upgrade one of the towers this AI controller placed (or unowned ones)
+        if (ai.upgradeCd <= 0 && lane.towers.length > 0) {
+          ai.upgradeCd = aiThinkInterval(ai.difficulty) * 1.8 * (0.8 + Math.random() * 0.5);
+          const w = walletOf(lane, ai.slot);
+          const candidates = lane.towers
+            .filter(t => t.placedBySlot === ai.slot || lane.controllers.length === 1)
+            .map(t => {
+              const def = TOWERS[t.kind];
+              if (t.tier >= 3) return null;
+              const pathIdx = t.pathIdx ?? (Math.random() < 0.5 ? 0 : 1);
+              const cost = upgradeCostFor(def, pathIdx, t.tier);
+              if (cost === null || w < cost) return null;
+              return { t, pathIdx, cost };
+            })
+            .filter((x): x is { t: Tower; pathIdx: number; cost: number } => x !== null);
+          if (candidates.length > 0) {
+            const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            tryUpgradeTowerOn(lane, pick.t.id, pick.pathIdx, ai.slot);
+          }
         }
       }
     };
@@ -1286,6 +1515,11 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
               .sort((a, b) => a.d - b.d)
               .slice(0, def.empAttack!.targets);
             for (const x of inRange) {
+              if (isAegisProtected(lane, x.t.pos)) {
+                x.t.stunUntil = 0; // aegis also clears existing stuns
+                lane.floaters.push({ text: "AEGIS", pos: { ...x.t.pos }, ttl: 0.8, color: "#7ad7ff" });
+                continue;
+              }
               x.t.stunUntil = Math.max(x.t.stunUntil, now + def.empAttack!.duration);
               lane.floaters.push({ text: "EMP", pos: { ...x.t.pos }, ttl: 1.0, color: "#fff37a" });
               lane.zaps.push({ points: [e.pos, x.t.pos], ttl: 0.3 });
@@ -1327,6 +1561,74 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         }
       }
 
+      // ===== Allied units (sent from opposing team's commanders, or from own depot) =====
+      // Travel REVERSE along the path from waypoints[end] toward waypoints[0],
+      // shoot at nearest enemy in range, deal collision damage equal to remaining HP.
+      const wpForUnits = map.waypoints;
+      const totalLen = (() => { let s = 0; for (let i = 0; i < wpForUnits.length - 1; i++) s += dist(wpForUnits[i], wpForUnits[i + 1]); return s; })();
+      for (const a of lane.alliedUnits) {
+        if (!a.alive) continue;
+        const udef = UNITS[a.kind];
+
+        // Move along the path in reverse: position = traveled-from-end.
+        const newTraveled = a.traveled + udef.speed * dt;
+        const r = getPositionOnPath(wpForUnits, Math.max(0, totalLen - newTraveled));
+        a.pos = r.pos;
+        a.traveled = newTraveled;
+
+        // Despawn if it ran the full path without dying.
+        if (newTraveled >= totalLen) { a.alive = false; continue; }
+
+        // Shoot the nearest enemy in range.
+        a.cooldown -= dt;
+        if (a.cooldown <= 0 && udef.fireRate > 0) {
+          let best: Enemy | null = null; let bestD = Infinity;
+          for (const e of lane.enemies) {
+            if (!e.alive) continue;
+            const ed = ENEMIES[e.kind];
+            if (ed.hidden && !cloakKnown(lane, e)) continue;
+            const d2 = dist(a.pos, e.pos);
+            if (d2 <= udef.range && d2 < bestD) { best = e; bestD = d2; }
+          }
+          if (best) {
+            a.cooldown = 1 / udef.fireRate;
+            damageEnemy(lane, best, udef.damage, "physical");
+            lane.beams.push({ from: { ...a.pos }, to: { ...best.pos }, color: udef.accentColor, width: 1.4, ttl: 0.08 });
+            // EMP-on-hit (top-tier EMP infantry): also stun the nearest defending tower.
+            if (udef.empOnHit) {
+              let nearTower: Tower | null = null; let nd = Infinity;
+              for (const t of lane.towers) {
+                const d2 = dist(a.pos, t.pos);
+                if (d2 < nd && d2 <= udef.range) { nearTower = t; nd = d2; }
+              }
+              if (nearTower && !isAegisProtected(lane, nearTower.pos)) {
+                nearTower.stunUntil = Math.max(nearTower.stunUntil, now + udef.empOnHit.duration);
+                lane.zaps.push({ points: [a.pos, nearTower.pos], ttl: 0.25 });
+              }
+            }
+          }
+        }
+
+        // Collision: on contact, deal remaining HP to enemy and lose hp = enemy hp.
+        for (const e of lane.enemies) {
+          if (!e.alive) continue;
+          const ed = ENEMIES[e.kind];
+          if (dist(a.pos, e.pos) <= ed.radius + udef.radius) {
+            const aHp = a.hp, eHp = e.hp;
+            damageEnemy(lane, e, aHp, "physical");
+            a.hp -= eHp;
+            if (a.hp <= 0) {
+              a.alive = false;
+              if (udef.explodeOnDeath) {
+                triggerExplosion(lane, a.pos, udef.explodeOnDeath.radius, udef.explodeOnDeath.damage, "explosion");
+              }
+              break;
+            }
+          }
+        }
+      }
+      lane.alliedUnits = lane.alliedUnits.filter(a => a.alive);
+
       for (const t of lane.towers) {
         const def = TOWERS[t.kind];
         const stats = effectiveStats(def, t.pathIdx, t.tier);
@@ -1359,6 +1661,23 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
           if (t.mineTimer >= stats.mineCooldown) {
             t.mineTimer = 0;
             layMine(lane, t, stats, dmgMul);
+          }
+        }
+
+        // Vehicle Depot — spawn allied units onto OWN lane (travels REVERSE toward enemy spawn).
+        if (stats.depotSpawn && lane.waveActive && !stunned) {
+          t.spawnTimer += dt;
+          if (t.spawnTimer >= stats.depotSpawn.interval) {
+            t.spawnTimer = 0;
+            const wpEnd = map.waypoints[map.waypoints.length - 1];
+            const udef = UNITS[stats.depotSpawn.kind];
+            lane.alliedUnits.push({
+              id: idCounter.current++, kind: stats.depotSpawn.kind, hp: udef.hp, maxHp: udef.hp,
+              pos: { x: wpEnd.x, y: wpEnd.y },
+              traveled: 0, senderSlot: t.placedBySlot,
+              cooldown: 0, alive: true,
+            });
+            lane.floaters.push({ text: `+${udef.name}`, pos: { x: t.pos.x, y: t.pos.y - 18 }, ttl: 0.8, color: "#7ad7ff" });
           }
         }
 
@@ -1429,7 +1748,11 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
           fireRailgun(lane, t, visTarget, stats, dmgMul);
         } else if (t.kind === "flame") {
           fireFlame(lane, t, visTarget, stats, dmgMul);
-        } else if (t.kind === "drone" || t.kind === "bank" || t.kind === "recon" || t.kind === "minelayer" || t.kind === "engineer") {
+        } else if (
+          t.kind === "drone" || t.kind === "bank" || t.kind === "recon" ||
+          t.kind === "minelayer" || t.kind === "engineer" ||
+          t.kind === "command" || t.kind === "depot" || t.kind === "aegis"
+        ) {
           // no direct attack
         } else {
           if (stats.burstCount && stats.burstCount > 1) {
@@ -1518,7 +1841,8 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         // Only credit lanes we own — remote lanes get bonuses from their owner.
         for (const l of liveLanes) {
           if (oc && l.remote) continue;
-          l.money += bonus;
+          // Each controller of the lane gets the full bonus (their own wallet).
+          for (const s of l.controllers) addMoneyToSlot(l, s, bonus, mySlot);
           l.floaters.push({ text: `+${bonus} bonus`, pos: { x: W / 2, y: 50 }, ttl: 1.6, color: "#dc2626" });
         }
         if (levelRef.current >= 30) {
@@ -2237,7 +2561,7 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
             drawTower(ctx, {
               id: -1, kind: sk, pos: m, pathIdx: null, tier: 0,
               cooldown: 0, underbarrelCooldown: 0, burstQueue: 0, burstTimer: 0, burstTarget: null, aimAngle: 0,
-              incomeTimer: 0, mineTimer: 0, drones: [], stunUntil: 0,
+              incomeTimer: 0, mineTimer: 0, spawnTimer: 0, drones: [], stunUntil: 0, placedBySlot: mySlot,
             }, ok ? 0.7 : 0.45);
           }
         }
@@ -2269,6 +2593,52 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         if (p.arc) {
           ctx.fillStyle = "rgba(0,0,0,0.45)";
           ctx.beginPath(); ctx.arc(p.arc.targetX, p.arc.targetY, 3, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+
+      // Allied units (sent by command towers, or spawned by depot)
+      for (const a of lane.alliedUnits) {
+        if (!a.alive) continue;
+        const ud = UNITS[a.kind];
+        // Stealth ghost: render translucent unless detected by hidden-detect tower nearby (simple heuristic).
+        let alpha = 1;
+        if (ud.stealth) alpha = 0.45;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        // Body
+        ctx.fillStyle = ud.bodyColor;
+        ctx.strokeStyle = ud.accentColor;
+        ctx.lineWidth = 1.5;
+        if (ud.shape === "triangle") {
+          ctx.beginPath();
+          ctx.moveTo(a.pos.x, a.pos.y - ud.radius);
+          ctx.lineTo(a.pos.x + ud.radius, a.pos.y + ud.radius);
+          ctx.lineTo(a.pos.x - ud.radius, a.pos.y + ud.radius);
+          ctx.closePath();
+          ctx.fill(); ctx.stroke();
+        } else if (ud.shape === "square") {
+          ctx.fillRect(a.pos.x - ud.radius, a.pos.y - ud.radius, ud.radius * 2, ud.radius * 2);
+          ctx.strokeRect(a.pos.x - ud.radius, a.pos.y - ud.radius, ud.radius * 2, ud.radius * 2);
+        } else {
+          ctx.beginPath();
+          ctx.arc(a.pos.x, a.pos.y, ud.radius, 0, Math.PI * 2);
+          ctx.fill(); ctx.stroke();
+        }
+        // Direction tick (chevron showing movement direction)
+        ctx.fillStyle = ud.accentColor;
+        ctx.beginPath();
+        ctx.arc(a.pos.x, a.pos.y, 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+        // HP bar (only if damaged)
+        if (a.hp < ud.hp) {
+          const w = ud.radius * 2.2;
+          const x = a.pos.x - w / 2;
+          const y = a.pos.y - ud.radius - 6;
+          ctx.fillStyle = "rgba(0,0,0,0.55)";
+          ctx.fillRect(x - 1, y - 1, w + 2, 4);
+          ctx.fillStyle = a.hp / ud.hp > 0.5 ? "#34d399" : a.hp / ud.hp > 0.25 ? "#fbbf24" : "#ef4444";
+          ctx.fillRect(x, y, Math.max(0, w * (a.hp / ud.hp)), 2);
         }
       }
 
@@ -2400,7 +2770,10 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
   const hoveredEnemy = hoveredEnemyId != null ? lane.enemies.find(e => e.id === hoveredEnemyId) ?? null : null;
 
   const restart = () => {
-    lanesRef.current = makeLanes(mode, difficulty, playerName);
+    const oc = onlineRef.current;
+    lanesRef.current = oc
+      ? makeLanesOnline(oc.slots, oc.mySlot, oc.isHost, playerName, oc.lobbyMode)
+      : makeLanes(mode, difficulty, playerName);
     setLevel(1); levelRef.current = 1;
     setWaveActive(false); waveActiveRef.current = false;
     setSelectedKind(null); setSelectedTowerId(null);
@@ -2433,7 +2806,7 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
         </div>
         <div className="flex items-center gap-5">
           <Stat icon={<Heart className="w-4 h-4 text-primary" />} value={lanesRef.current[0].lives} label="Lives" />
-          <Stat icon={<Coins className="w-4 h-4 text-foreground" />} value={lanesRef.current[0].money} label="Funds" />
+          <Stat icon={<Coins className="w-4 h-4 text-foreground" />} value={walletOf(lanesRef.current[0], mySlot)} label="Funds" />
           <Stat icon={<Trophy className="w-4 h-4 text-primary" />} value={`${level} / 30`} label="Wave" />
         </div>
         <div className="flex items-center gap-2">
@@ -2558,9 +2931,9 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
               </div>
               <div className="px-2 py-2 max-h-[55%] overflow-y-auto">
                 <div className="grid grid-cols-1 gap-1">
-                  {TOWER_ORDER.map((k, idx) => {
+                  {TOWER_ORDER.filter(k => k !== "command" || mode !== "solo").map((k, idx) => {
                     const def = TOWERS[k];
-                    const canAfford = lanesRef.current[0].money >= def.cost;
+                    const canAfford = walletOf(lanesRef.current[0], mySlot) >= def.cost;
                     const selected = selectedKind === k;
                     const keyHint = idx < 9 ? (idx + 1).toString() : idx === 9 ? "0" : "";
                     return (
@@ -2595,13 +2968,19 @@ export default function Game({ map, mode, difficulty = "veteran", online, onExit
               {selectedTower ? (
                 <TowerPanel
                   tower={selectedTower}
-                  money={lanesRef.current[0].money}
+                  money={walletOf(lanesRef.current[0], mySlot)}
                   onUpgrade={(p) => upgradeTower(selectedTower.id, p)}
                   onSell={() => sellTower(selectedTower.id)}
+                  onBuyUnit={(kind, cost) => buyCommandUnit(selectedTower.id, kind, cost)}
                 />
               ) : (
                 <div className="p-3 flex-1 overflow-y-auto border-t border-border">
-                  <ThreatPanel level={level} intelLevel={intelL} />
+                  <ThreatPanel
+                    level={level}
+                    intelLevel={intelL}
+                    lane={lane}
+                    slotLabels={online ? Object.fromEntries(online.slots.map(s => [s.index, s.kind === "player" ? (s.playerName ?? `P${s.index}`) : `AI ${s.index}`])) : undefined}
+                  />
                   <div className="mt-4 pt-3 border-t border-border text-[10px] text-muted-foreground leading-relaxed">
                     Hover any visible enemy to inspect stats. Auto-wave deploys the next wave 4s after the current ends.
                   </div>
@@ -2648,6 +3027,9 @@ function TowerKindIcon({ kind }: { kind: TowerKind }) {
     kind === "engineer" ? Wrench :
     kind === "recon" ? Radar :
     kind === "bank" ? DollarSign :
+    kind === "aegis" ? ShieldPlus :
+    kind === "depot" ? Truck :
+    kind === "command" ? Send :
     Crosshair;
   const stats = def.base;
   return (
@@ -2721,8 +3103,17 @@ function EnemyTooltip({ enemy }: { enemy: Enemy }) {
   );
 }
 
-function ThreatPanel({ level, intelLevel }: { level: number; intelLevel: number }) {
+function ThreatPanel({ level, intelLevel, lane, slotLabels }: { level: number; intelLevel: number; lane?: Lane; slotLabels?: Record<number, string> }) {
   const wave = generateWave(level);
+  // Group queued incoming sent units by senderSlot (only meaningful in 2v2).
+  const queueGroups = new Map<number, Map<UnitKind, number>>();
+  if (lane) {
+    for (const q of lane.unitQueue) {
+      let m = queueGroups.get(q.senderSlot);
+      if (!m) { m = new Map(); queueGroups.set(q.senderSlot, m); }
+      m.set(q.kind, (m.get(q.kind) ?? 0) + 1);
+    }
+  }
   return (
     <>
       <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center gap-2">
@@ -2752,6 +3143,38 @@ function ThreatPanel({ level, intelLevel }: { level: number; intelLevel: number 
           );
         })}
       </div>
+      {queueGroups.size > 0 && (
+        <div className="mt-3 pt-3 border-t border-border">
+          <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-1.5 flex items-center gap-1.5">
+            <Send className="w-3 h-3" /> Incoming Reinforcements
+          </div>
+          <div className="space-y-1 text-[11px]">
+            {Array.from(queueGroups.entries()).map(([senderSlot, m]) => {
+              const senderLabel = intelLevel >= 3 ? (slotLabels?.[senderSlot] ?? `Slot ${senderSlot}`) : "Unknown sender";
+              return (
+                <div key={senderSlot} className="border border-border rounded-sm px-1.5 py-1">
+                  <div className="text-[10px] text-amber-400 font-bold mb-0.5">{senderLabel}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {Array.from(m.entries()).map(([k, c]) => {
+                      const ud = UNITS[k];
+                      return (
+                        <div key={k} className="flex items-center gap-1">
+                          <div className="w-2.5 h-2.5 rounded-sm" style={{ background: ud.bodyColor, border: `1px solid ${ud.accentColor}` }} />
+                          <span className="text-foreground">{ud.name}</span>
+                          <span className="font-mono text-[10px] text-muted-foreground">×{c}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {intelLevel < 3 && (
+            <div className="mt-1.5 text-[9px] text-muted-foreground italic">Upgrade Recon to L3 to identify the sender.</div>
+          )}
+        </div>
+      )}
     </>
   );
 }
@@ -2760,7 +3183,8 @@ function SpectatorPanel({ lane, intelLevel, isAlly, onReturn }: { lane: Lane; in
   const visibleTowers = isAlly ? lane.towers : lane.towers.filter(t => towerRevealed(t.id, intelLevel));
   const knownCount = visibleTowers.length;
   const hiddenCount = lane.towers.length - knownCount;
-  const moneyShown = isAlly ? lane.money.toString() : intelLevel >= 2 ? lane.money.toString() : "Locked (need Intel L2)";
+  const allyTotalMoney = lane.controllers.reduce((s, c) => s + (lane.wallets[c] ?? 0), 0);
+  const moneyShown = isAlly ? `${allyTotalMoney} (team)` : intelLevel >= 2 ? lane.money.toString() : "Locked (need Intel L2)";
 
   // Tower kind aggregates (revealed only)
   const counts = new Map<TowerKind, number>();
@@ -2868,7 +3292,7 @@ function SpecStat({ label, value, icon, mono }: { label: string; value: string |
   );
 }
 
-function TowerPanel({ tower, money, onUpgrade, onSell }: { tower: Tower; money: number; onUpgrade: (p: number) => void; onSell: () => void }) {
+function TowerPanel({ tower, money, onUpgrade, onSell, onBuyUnit }: { tower: Tower; money: number; onUpgrade: (p: number) => void; onSell: () => void; onBuyUnit?: (kind: UnitKind, cost: number) => void }) {
   const def = TOWERS[tower.kind];
   const stats = effectiveStats(def, tower.pathIdx, tower.tier);
   const sellAmt = Math.round(totalSpent(def, tower.pathIdx, tower.tier) * 0.65);
@@ -2938,6 +3362,46 @@ function TowerPanel({ tower, money, onUpgrade, onSell }: { tower: Tower; money: 
           Sell · {sellAmt}g
         </Button>
       </div>
+
+      {stats.commandUnits && onBuyUnit && (
+        <div className="p-3 border-b border-border">
+          <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 flex items-center gap-2">
+            <Send className="w-3 h-3" /> Send to Enemy Lane
+          </div>
+          <div className="text-[10px] text-muted-foreground leading-snug mb-2">
+            Purchases queue here; units deploy at next wave start into the opposing lane.
+          </div>
+          <div className="grid grid-cols-1 gap-1">
+            {stats.commandUnits.map((cu) => {
+              const ud = UNITS[cu.kind];
+              const can = money >= cu.cost;
+              return (
+                <button
+                  key={cu.kind}
+                  onClick={() => onBuyUnit(cu.kind, cu.cost)}
+                  disabled={!can}
+                  className={`text-left px-2 py-1.5 rounded-sm border transition-all ${
+                    can ? "border-border/60 hover:border-primary/50 hover:bg-muted/30" : "border-border opacity-40 cursor-not-allowed"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <div className="w-5 h-5 rounded-sm flex-shrink-0" style={{ background: ud.bodyColor, border: `1px solid ${ud.accentColor}` }} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-bold tracking-tight">{cu.label}</div>
+                      <div className="text-[10px] text-muted-foreground leading-tight truncate">
+                        HP {ud.hp} · DMG {ud.damage} · SPD {ud.speed}
+                      </div>
+                    </div>
+                    <div className="flex items-center text-[11px] font-mono font-bold">
+                      <Coins className="w-3 h-3 mr-0.5 text-muted-foreground" />{cu.cost}
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="p-3">
         <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2">Choose Upgrade Path</div>
